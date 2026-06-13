@@ -302,3 +302,31 @@
     background: rgba(110, 197, 119, 0.25);
     color: #8fd696;
 }
+
+/* ---------- iOS / 移动端适配 ---------- */
+@media (max-width: 480px) {
+    .ipe-panel {
+        left: 8px;
+        right: 8px;
+        bottom: 78px;
+        width: auto;
+        max-height: 70vh;
+        border-radius: 12px;
+    }
+
+    .ipe-ball {
+        bottom: 20px;
+        right: 20px;
+        width: 38px;
+        height: 38px;
+    }
+
+    .ipe-section-body textarea {
+        font-size: 14px; /* iOS 下小于 16px 会触发页面缩放 */
+    }
+
+    .ipe-section-body input[type="text"],
+    .ipe-section-body input[type="password"] {
+        font-size: 14px;
+    }
+}
