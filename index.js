@@ -1,514 +1,365 @@
 /*
- * ============================================================
  *  Image Prompt Extractor (图像提示词提取器)
- *  SillyTavern 第三方扩展
- *
- *  功能：从 RP 正文提取场景，通过独立 API 生成 image### 标签，
- *        注入正文消息供生图插件读取。主 API 不感知此过程。
- * ============================================================
+ *  SillyTavern 1.18+ — 使用 SillyTavern.getContext() API
  */
 
-import { extension_settings, getContext } from "../../../extensions.js";
-import {
-    eventSource,
-    event_types,
-    saveSettingsDebounced,
-    saveChatConditional,
-} from "../../../../script.js";
-
-/* ────────────────────────────────────────────
-   常量与默认设置
-   ──────────────────────────────────────────── */
-
 const EXT_NAME = "image-prompt-extractor";
-
-const DEFAULT_SETTINGS = {
-    enabled: true,
-    apiEndpoint: "",
-    apiKey: "",
-    model: "",
-    systemPrompt: "",
-    baseTemplate: "",
-    characterAnchors: "",
-    extractionRules: "",
+const DEFAULTS = {
+    enabled: true, apiEndpoint: "", apiKey: "", model: "",
+    systemPrompt: "", baseTemplate: "", characterAnchors: "", extractionRules: "",
 };
 
-/* ────────────────────────────────────────────
-   运行时状态
-   ──────────────────────────────────────────── */
+let currentDesc = "", currentIdx = -1, processing = false, initialized = false;
 
-let currentDescription = "";
-let currentMessageIndex = -1;
-let isProcessing = false;
+/* ── ST 上下文（懒加载）── */
+function ctx() { return SillyTavern.getContext(); }
 
-/* ────────────────────────────────────────────
-   设置管理
-   ──────────────────────────────────────────── */
-
+/* ── 设置 ── */
 function loadSettings() {
-    if (!extension_settings[EXT_NAME]) {
-        extension_settings[EXT_NAME] = {};
-    }
-    for (const [key, val] of Object.entries(DEFAULT_SETTINGS)) {
-        if (extension_settings[EXT_NAME][key] === undefined) {
-            extension_settings[EXT_NAME][key] = val;
-        }
+    const { extensionSettings } = ctx();
+    if (!extensionSettings[EXT_NAME]) extensionSettings[EXT_NAME] = {};
+    for (const [k, v] of Object.entries(DEFAULTS)) {
+        if (extensionSettings[EXT_NAME][k] === undefined) extensionSettings[EXT_NAME][k] = v;
     }
 }
-
-function s() {
-    return extension_settings[EXT_NAME];
+function cfg() { return ctx().extensionSettings[EXT_NAME]; }
+function save(key, val) {
+    ctx().extensionSettings[EXT_NAME][key] = val;
+    ctx().saveSettingsDebounced();
 }
 
-function save(key, value) {
-    extension_settings[EXT_NAME][key] = value;
-    saveSettingsDebounced();
+/* ── 工具 ── */
+function esc(s) {
+    if (!s) return "";
+    const d = document.createElement("div"); d.textContent = s; return d.innerHTML;
 }
+function q(s) { return document.querySelector(s); }
 
-/* ────────────────────────────────────────────
-   工具函数
-   ──────────────────────────────────────────── */
-
-function esc(str) {
-    if (!str) return "";
-    const d = document.createElement("div");
-    d.textContent = str;
-    return d.innerHTML;
-}
-
-function $(sel) {
-    return document.querySelector(sel);
-}
-
-/* ────────────────────────────────────────────
-   UI 创建
-   ──────────────────────────────────────────── */
+/* ════════════════════════════════════════
+   UI
+   ════════════════════════════════════════ */
 
 function createUI() {
-    // —— 悬浮球 ——
+    createBall();
+    createPanel();
+    createDrawer();
+    bindAll();
+}
+
+function createBall() {
+    if (q("#ipe-ball")) return;
     const ball = document.createElement("div");
     ball.id = "ipe-ball";
     ball.className = "ipe-ball";
     ball.title = "图像提示词提取器";
-    ball.addEventListener("click", togglePanel);
+    ball.addEventListener("click", () => {
+        const p = q("#ipe-panel");
+        if (p) p.classList.toggle("visible");
+    });
     document.body.appendChild(ball);
+}
 
-    // —— 主面板 ——
+function createPanel() {
+    if (q("#ipe-panel")) return;
+    const c = cfg();
     const panel = document.createElement("div");
     panel.id = "ipe-panel";
     panel.className = "ipe-panel";
-    panel.innerHTML = buildPanelHTML();
-    document.body.appendChild(panel);
-
-    bindEvents();
-    restoreCollapsedState();
-}
-
-function buildPanelHTML() {
-    const c = s();
-    return `
+    panel.innerHTML = `
     <div class="ipe-panel-header">
         <span class="ipe-panel-title">图像提示词提取器</span>
         <label class="ipe-toggle">
-            <input type="checkbox" id="ipe-enabled" ${c.enabled ? "checked" : ""}>
+            <input type="checkbox" id="ipe-enabled" ${c.enabled?"checked":""}>
             <span class="ipe-toggle-slider"></span>
         </label>
     </div>
     <div class="ipe-sections">
-
-        ${section("api-config", "API 配置", `
-            <label>API 地址
-                <input type="text" id="ipe-api-endpoint"
-                       value="${esc(c.apiEndpoint)}"
-                       placeholder="https://api.openai.com/v1/chat/completions">
-            </label>
-            <label>API 密钥
-                <input type="password" id="ipe-api-key"
-                       value="${esc(c.apiKey)}"
-                       placeholder="sk-...">
-            </label>
-            <label>模型
-                <input type="text" id="ipe-model"
-                       value="${esc(c.model)}"
-                       placeholder="gpt-4o-mini">
-            </label>
-        `)}
-
-        ${section("system-prompt", "系统提示", `
-            <textarea id="ipe-system-prompt" rows="5"
-                placeholder="你是一个专精中文文学场景视觉化的提示词专家…"
-            >${esc(c.systemPrompt)}</textarea>
-        `)}
-
-        ${section("base-template", "基础模板", `
-            <textarea id="ipe-base-template" rows="6"
-                placeholder="image###Premium otome game CG illustration...{Description}...###"
-            >${esc(c.baseTemplate)}</textarea>
-            <div class="ipe-hint">用 {Description} 标记描述文本的插入位置</div>
-        `)}
-
-        ${section("char-anchors", "角色锚点", `
-            <textarea id="ipe-char-anchors" rows="5"
-                placeholder="陆冀北：a man, early 30s, tall with broad shoulders, deep-set eyes…"
-            >${esc(c.characterAnchors)}</textarea>
-        `)}
-
-        ${section("extract-rules", "提取规则", `
-            <textarea id="ipe-extract-rules" rows="5"
-                placeholder="先写场景1-2句，再按在场人数逐人描述…"
-            >${esc(c.extractionRules)}</textarea>
-        `)}
-
-        ${section("preview", "预览", `
-            <div id="ipe-preview-status" class="ipe-preview-status">等待新消息…</div>
-            <textarea id="ipe-preview-text" rows="6"
-                placeholder="生成的 Description 将显示在这里…"></textarea>
-            <label>补充指令
-                <input type="text" id="ipe-supplement"
-                       placeholder="例：这段是冷战不是撒娇">
-            </label>
+        ${sec("api-config","API 配置",`
+            <label>API 地址<input type="text" id="ipe-api-endpoint" value="${esc(c.apiEndpoint)}" placeholder="https://api.openai.com/v1/chat/completions"></label>
+            <label>API 密钥<input type="password" id="ipe-api-key" value="${esc(c.apiKey)}" placeholder="sk-..."></label>
+            <label>模型<input type="text" id="ipe-model" value="${esc(c.model)}" placeholder="gpt-4o-mini"></label>`)}
+        ${sec("system-prompt","系统提示",`
+            <textarea id="ipe-system-prompt" rows="5" placeholder="你是一个专精中文文学场景视觉化的提示词专家…">${esc(c.systemPrompt)}</textarea>`)}
+        ${sec("base-template","基础模板",`
+            <textarea id="ipe-base-template" rows="6" placeholder="image###...{Description}...###">${esc(c.baseTemplate)}</textarea>
+            <div class="ipe-hint">用 {Description} 标记描述文本的插入位置</div>`)}
+        ${sec("char-anchors","角色锚点",`
+            <textarea id="ipe-char-anchors" rows="5" placeholder="陆冀北：a man, early 30s, tall…">${esc(c.characterAnchors)}</textarea>`)}
+        ${sec("extract-rules","提取规则",`
+            <textarea id="ipe-extract-rules" rows="5" placeholder="先写场景1-2句，再按在场人数逐人描述…">${esc(c.extractionRules)}</textarea>`)}
+        ${sec("preview","预览",`
+            <div id="ipe-status" class="ipe-preview-status">等待新消息…</div>
+            <textarea id="ipe-preview-text" rows="6" placeholder="生成的 Description 将显示在这里…"></textarea>
+            <label>补充指令<input type="text" id="ipe-supplement" placeholder="例：这段是冷战不是撒娇"></label>
             <div class="ipe-preview-actions">
                 <button id="ipe-btn-extract" class="ipe-btn">手动提取</button>
                 <button id="ipe-btn-reroll" class="ipe-btn" disabled>重新生成</button>
                 <button id="ipe-btn-inject" class="ipe-btn ipe-btn-primary" disabled>确认注入</button>
+            </div>`,false)}
+    </div>`;
+    document.body.appendChild(panel);
+}
+
+function sec(id, title, body, collapsed = true) {
+    return `<div class="ipe-section${collapsed?" collapsed":""}" id="ipe-section-${id}">
+        <div class="ipe-section-header"><span>${title}</span><span class="ipe-collapse-icon">▾</span></div>
+        <div class="ipe-section-body">${body}</div></div>`;
+}
+
+function createDrawer() {
+    if (q("#ipe-drawer")) return;
+    const c = cfg();
+    const html = `<div id="ipe-drawer">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>🎨 图像提示词提取器</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
-        `, false)}
-
-    </div>`;
-}
-
-function section(id, title, body, collapsed = true) {
-    return `
-    <div class="ipe-section ${collapsed ? "collapsed" : ""}" id="ipe-section-${id}">
-        <div class="ipe-section-header" data-section="${id}">
-            <span>${title}</span>
-            <span class="ipe-collapse-icon">▾</span>
+            <div class="inline-drawer-content">
+                <div style="margin-bottom:6px"><label>启用 <input type="checkbox" id="iped-enabled" ${c.enabled?"checked":""}></label></div>
+                <hr><small><b>API 配置</b></small>
+                <label>API 地址</label><input type="text" id="iped-api-endpoint" class="text_pole" value="${esc(c.apiEndpoint)}" placeholder="https://api.openai.com/v1/chat/completions">
+                <label>API 密钥</label><input type="password" id="iped-api-key" class="text_pole" value="${esc(c.apiKey)}" placeholder="sk-...">
+                <label>模型</label><input type="text" id="iped-model" class="text_pole" value="${esc(c.model)}" placeholder="gpt-4o-mini">
+                <hr><small><b>系统提示</b></small>
+                <textarea id="iped-system-prompt" class="text_pole" rows="4" placeholder="你是一个专精中文文学场景视觉化的提示词专家…">${esc(c.systemPrompt)}</textarea>
+                <hr><small><b>基础模板</b></small>
+                <textarea id="iped-base-template" class="text_pole" rows="5" placeholder="image###...{Description}...###">${esc(c.baseTemplate)}</textarea>
+                <small style="color:#888">用 {Description} 标记插入位置</small>
+                <hr><small><b>角色锚点</b></small>
+                <textarea id="iped-char-anchors" class="text_pole" rows="4" placeholder="陆冀北：a man, early 30s, tall…">${esc(c.characterAnchors)}</textarea>
+                <hr><small><b>提取规则</b></small>
+                <textarea id="iped-extract-rules" class="text_pole" rows="4" placeholder="先写场景1-2句，再按在场人数逐人描述…">${esc(c.extractionRules)}</textarea>
+                <hr><small><b>预览</b></small>
+                <div id="iped-status" style="color:#888;font-size:12px;margin:4px 0">等待新消息…</div>
+                <textarea id="iped-preview-text" class="text_pole" rows="5" placeholder="生成的 Description 将显示在这里…"></textarea>
+                <label>补充指令</label><input type="text" id="iped-supplement" class="text_pole" placeholder="例：这段是冷战不是撒娇">
+                <div style="display:flex;gap:6px;margin-top:6px">
+                    <input type="button" id="iped-btn-extract" class="menu_button" value="手动提取">
+                    <input type="button" id="iped-btn-reroll" class="menu_button" value="重新生成" disabled>
+                    <input type="button" id="iped-btn-inject" class="menu_button" value="确认注入" disabled>
+                </div>
+            </div>
         </div>
-        <div class="ipe-section-body">${body}</div>
     </div>`;
+    const target = jQuery("#extensions_settings2");
+    if (target.length) {
+        target.append(html);
+        console.log("[IPE] 抽屉已挂载");
+    }
 }
 
-/* ────────────────────────────────────────────
-   UI 交互
-   ──────────────────────────────────────────── */
-
-function togglePanel() {
-    const panel = $("#ipe-panel");
-    panel.classList.toggle("visible");
-}
-
-function restoreCollapsedState() {
-    // 预览区默认展开，其余默认折叠（已在 HTML 中设置）
-}
-
-function setStatus(text, type = "") {
-    const el = $("#ipe-preview-status");
-    if (!el) return;
-    el.textContent = text;
-    el.className = "ipe-preview-status" + (type ? ` ${type}` : "");
-}
-
-function setBallState(state) {
-    const ball = $("#ipe-ball");
-    if (!ball) return;
-    ball.classList.remove("processing", "has-result");
-    if (state) ball.classList.add(state);
-}
-
-function setButtonsEnabled(reroll, inject) {
-    const br = $("#ipe-btn-reroll");
-    const bi = $("#ipe-btn-inject");
-    if (br) br.disabled = !reroll;
-    if (bi) bi.disabled = !inject;
-}
-
-/* ────────────────────────────────────────────
+/* ════════════════════════════════════════
    事件绑定
-   ──────────────────────────────────────────── */
+   ════════════════════════════════════════ */
 
-function bindEvents() {
-    // 折叠区块切换
-    document.querySelectorAll(".ipe-section-header").forEach((header) => {
-        header.addEventListener("click", () => {
-            header.parentElement.classList.toggle("collapsed");
-        });
-    });
-
-    // 开关
-    $("#ipe-enabled")?.addEventListener("change", (e) => {
-        save("enabled", e.target.checked);
-    });
-
-    // 设置项自动保存
-    const bindings = [
-        ["ipe-api-endpoint", "apiEndpoint"],
-        ["ipe-api-key", "apiKey"],
-        ["ipe-model", "model"],
-        ["ipe-system-prompt", "systemPrompt"],
-        ["ipe-base-template", "baseTemplate"],
-        ["ipe-char-anchors", "characterAnchors"],
-        ["ipe-extract-rules", "extractionRules"],
+function bindAll() {
+    // 折叠
+    document.querySelectorAll(".ipe-section-header").forEach(h =>
+        h.addEventListener("click", () => h.parentElement.classList.toggle("collapsed"))
+    );
+    // 设置同步
+    const fields = [
+        ["apiEndpoint","ipe-api-endpoint","iped-api-endpoint"],
+        ["apiKey","ipe-api-key","iped-api-key"],
+        ["model","ipe-model","iped-model"],
+        ["systemPrompt","ipe-system-prompt","iped-system-prompt"],
+        ["baseTemplate","ipe-base-template","iped-base-template"],
+        ["characterAnchors","ipe-char-anchors","iped-char-anchors"],
+        ["extractionRules","ipe-extract-rules","iped-extract-rules"],
     ];
-    for (const [elId, key] of bindings) {
-        const el = $(`#${elId}`);
-        if (el) {
-            el.addEventListener("input", () => save(key, el.value));
+    for (const [key, id1, id2] of fields) {
+        for (const id of [id1, id2]) {
+            const el = q("#"+id);
+            if (!el) continue;
+            el.addEventListener("input", () => {
+                save(key, el.value);
+                const o = q("#"+(id===id1?id2:id1));
+                if (o && o!==el) o.value = el.value;
+            });
         }
     }
-
+    // 开关
+    for (const id of ["ipe-enabled","iped-enabled"]) {
+        const el = q("#"+id);
+        if (!el) continue;
+        el.addEventListener("change", () => {
+            save("enabled", el.checked);
+            const o = q("#"+(id==="ipe-enabled"?"iped-enabled":"ipe-enabled"));
+            if (o) o.checked = el.checked;
+        });
+    }
     // 按钮
-    $("#ipe-btn-extract")?.addEventListener("click", onManualExtract);
-    $("#ipe-btn-reroll")?.addEventListener("click", onReroll);
-    $("#ipe-btn-inject")?.addEventListener("click", onConfirmInject);
-
-    // 监听 ST 新消息事件
-    if (typeof eventSource !== "undefined" && event_types?.MESSAGE_RECEIVED) {
-        eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    for (const p of ["ipe","iped"]) {
+        q("#"+p+"-btn-extract")?.addEventListener("click", onExtract);
+        q("#"+p+"-btn-reroll")?.addEventListener("click", onReroll);
+        q("#"+p+"-btn-inject")?.addEventListener("click", onInject);
+    }
+    // ST 消息事件
+    const { eventSource, event_types } = ctx();
+    if (eventSource && event_types.MESSAGE_RECEIVED) {
+        eventSource.on(event_types.MESSAGE_RECEIVED, onMsgReceived);
+        console.log("[IPE] 已绑定消息事件");
     }
 }
 
-/* ────────────────────────────────────────────
-   API 调用
-   ──────────────────────────────────────────── */
+/* ════════════════════════════════════════
+   API
+   ════════════════════════════════════════ */
 
-async function callExtractionAPI(rpText, supplement = "") {
-    const c = s();
-
-    if (!c.apiEndpoint || !c.model) {
-        throw new Error("请先配置 API 地址和模型");
-    }
-
-    // 组装 user 消息：角色锚点 + 提取规则 + 正文 + 补充指令
-    let userContent = "";
-
-    if (c.characterAnchors) {
-        userContent += `【角色外貌锚点】\n${c.characterAnchors}\n\n`;
-    }
-    if (c.extractionRules) {
-        userContent += `【提取规则】\n${c.extractionRules}\n\n`;
-    }
-
-    userContent += `【正文内容】\n${rpText}`;
-
-    if (supplement) {
-        userContent += `\n\n【补充指令】\n${supplement}`;
-    }
-
-    userContent += `\n\n请根据以上正文内容，按照提取规则，输出一段英文 Description。只输出 Description 本身，不要附加任何解释或格式标记。`;
-
-    // 构建请求（OpenAI 兼容格式）
-    const headers = {
-        "Content-Type": "application/json",
-    };
-    if (c.apiKey) {
-        headers["Authorization"] = `Bearer ${c.apiKey}`;
-    }
-
-    const body = {
-        model: c.model,
-        messages: [
-            { role: "system", content: c.systemPrompt || "You are an expert at extracting visual scene descriptions from Chinese literary roleplay text and writing them as English image generation prompts." },
-            { role: "user", content: userContent },
-        ],
-        max_tokens: 600,
-        temperature: 0.7,
-    };
-
-    const response = await fetch(c.apiEndpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
+async function callAPI(text, supplement) {
+    const c = cfg();
+    if (!c.apiEndpoint || !c.model) throw new Error("请先配置 API");
+    let user = "";
+    if (c.characterAnchors) user += "【角色外貌锚点】\n"+c.characterAnchors+"\n\n";
+    if (c.extractionRules) user += "【提取规则】\n"+c.extractionRules+"\n\n";
+    user += "【正文内容】\n"+text;
+    if (supplement) user += "\n\n【补充指令】\n"+supplement;
+    user += "\n\n请根据以上正文内容，按照提取规则，输出一段英文 Description。只输出 Description 本身，不要附加任何解释或格式标记。";
+    const headers = {"Content-Type":"application/json"};
+    if (c.apiKey) headers["Authorization"] = "Bearer "+c.apiKey;
+    const res = await fetch(c.apiEndpoint, {
+        method:"POST", headers,
+        body: JSON.stringify({
+            model: c.model,
+            messages: [
+                {role:"system", content: c.systemPrompt || "You are an expert at extracting visual scene descriptions from Chinese literary roleplay text and writing them as English image generation prompts."},
+                {role:"user", content: user},
+            ],
+            max_tokens: 600, temperature: 0.7,
+        }),
     });
-
-    if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(`API 返回 ${response.status}: ${errText.slice(0, 200)}`);
-    }
-
-    const data = await response.json();
-
-    // 兼容 OpenAI 和 Anthropic 响应格式
-    let result = "";
-    if (data.choices?.[0]?.message?.content) {
-        // OpenAI 格式
-        result = data.choices[0].message.content.trim();
-    } else if (data.content?.[0]?.text) {
-        // Anthropic 格式
-        result = data.content[0].text.trim();
-    } else {
-        throw new Error("无法解析 API 响应");
-    }
-
-    return result;
+    if (!res.ok) throw new Error("API "+res.status);
+    const data = await res.json();
+    if (data.choices?.[0]?.message?.content) return data.choices[0].message.content.trim();
+    if (data.content?.[0]?.text) return data.content[0].text.trim();
+    throw new Error("无法解析响应");
 }
 
-function assembleTag(description) {
-    const template = s().baseTemplate || "image###{Description}###";
+/* ════════════════════════════════════════
+   操作逻辑
+   ════════════════════════════════════════ */
 
-    if (template.includes("{Description}")) {
-        return template.replace("{Description}", description);
+function setStatus(t, color) {
+    for (const id of ["#ipe-status","#iped-status"]) {
+        const e = q(id); if (e) { e.textContent = t; e.style.color = color||""; }
     }
-
-    // 如果模板里没有占位符，追加到末尾（兜底）
-    return template + description;
+}
+function setPreview(t) {
+    for (const id of ["#ipe-preview-text","#iped-preview-text"]) {
+        const e = q(id); if (e) { e.value = t; e.disabled = false; }
+    }
+}
+function setBtns(r, j) {
+    for (const p of ["ipe","iped"]) {
+        const br = q("#"+p+"-btn-reroll"), bj = q("#"+p+"-btn-inject");
+        if (br) br.disabled = !r; if (bj) bj.disabled = !j;
+    }
 }
 
-/* ────────────────────────────────────────────
-   消息处理
-   ──────────────────────────────────────────── */
-
-async function onMessageReceived(messageIndex) {
-    if (!s().enabled || isProcessing) return;
-
-    const context = getContext();
-    const msg = context.chat?.[messageIndex];
-
-    // 只处理 AI 回复（非用户消息）
+function onMsgReceived(idx) {
+    if (!cfg().enabled || processing) return;
+    const msg = ctx().chat?.[idx];
     if (!msg || msg.is_user) return;
-
-    currentMessageIndex = messageIndex;
-    await runExtraction(msg.mes);
+    currentIdx = idx;
+    runExtract(msg.mes);
 }
 
-async function onManualExtract() {
-    if (isProcessing) return;
-
-    const context = getContext();
-    const chat = context.chat;
-    if (!chat || chat.length === 0) return;
-
-    // 找最后一条 AI 消息
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (!chat[i].is_user) {
-            currentMessageIndex = i;
-            await runExtraction(chat[i].mes);
-            return;
-        }
+async function onExtract() {
+    if (processing) return;
+    const chat = ctx().chat;
+    if (!chat?.length) { setStatus("无法读取聊天","#d4726a"); return; }
+    for (let i = chat.length-1; i >= 0; i--) {
+        if (!chat[i].is_user) { currentIdx = i; await runExtract(chat[i].mes); return; }
     }
-
-    setStatus("未找到 AI 消息", "error");
+    setStatus("未找到 AI 消息","#d4726a");
 }
 
-async function runExtraction(rpText, supplement = "") {
-    isProcessing = true;
-    setBallState("processing");
-    setStatus("正在提取…", "active");
-    setButtonsEnabled(false, false);
-
+async function runExtract(text, supplement) {
+    processing = true;
+    const ball = q("#ipe-ball");
+    if (ball) ball.classList.add("processing");
+    setStatus("正在提取…","#6ec577");
+    setBtns(false,false);
     try {
-        const description = await callExtractionAPI(rpText, supplement);
-
-        currentDescription = description;
-
-        // 显示在预览区
-        const previewEl = $("#ipe-preview-text");
-        if (previewEl) {
-            previewEl.value = description;
-            previewEl.disabled = false;
-        }
-
-        setStatus("提取完成 — 可编辑后确认注入", "active");
-        setButtonsEnabled(true, true);
-        setBallState("has-result");
-
-        // 展开预览区
-        const previewSection = $("#ipe-section-preview");
-        if (previewSection) previewSection.classList.remove("collapsed");
-    } catch (err) {
-        console.error("[IPE] 提取失败:", err);
-        setStatus(`提取失败: ${err.message}`, "error");
-        setButtonsEnabled(false, false);
-        setBallState("");
+        const desc = await callAPI(text, supplement||"");
+        currentDesc = desc;
+        setPreview(desc);
+        setStatus("提取完成 — 可编辑后确认注入","#6ec577");
+        setBtns(true,true);
+        if (ball) { ball.classList.remove("processing"); ball.classList.add("has-result"); }
+        const s = q("#ipe-section-preview"); if (s) s.classList.remove("collapsed");
+    } catch(e) {
+        console.error("[IPE]", e);
+        setStatus("失败: "+e.message,"#d4726a");
+        setBtns(false,false);
+        if (ball) ball.classList.remove("processing");
     }
-
-    isProcessing = false;
+    processing = false;
 }
 
 async function onReroll() {
-    if (isProcessing || currentMessageIndex < 0) return;
-
-    const context = getContext();
-    const msg = context.chat?.[currentMessageIndex];
-    if (!msg) return;
-
-    const supplement = $("#ipe-supplement")?.value || "";
-    await runExtraction(msg.mes, supplement);
+    if (processing || currentIdx < 0) return;
+    const msg = ctx().chat?.[currentIdx]; if (!msg) return;
+    const sup = q("#ipe-supplement")?.value || q("#iped-supplement")?.value || "";
+    await runExtract(msg.mes, sup);
 }
 
-async function onConfirmInject() {
-    if (currentMessageIndex < 0) return;
+function onInject() {
+    if (currentIdx < 0) return;
+    const desc = q("#ipe-preview-text")?.value || q("#iped-preview-text")?.value || currentDesc;
+    if (!desc) { setStatus("没有内容","#d4726a"); return; }
+    const tpl = cfg().baseTemplate || "image###{Description}###";
+    const tag = tpl.includes("{Description}") ? tpl.replace("{Description}", desc) : tpl+desc;
+    try {
+        const c = ctx();
+        const msg = c.chat?.[currentIdx];
+        if (!msg) throw new Error("消息不存在");
+        msg.mes = msg.mes.trimEnd()+"\n\n"+tag;
+        if (typeof c.saveChat === "function") c.saveChat();
+        const el = document.querySelector('#chat .mes[mesid="'+currentIdx+'"] .mes_text');
+        if (el) el.innerHTML += "<p>"+esc(tag)+"</p>";
+        setStatus("已注入 ✓","#6ec577");
+        setBtns(false,false);
+        const ball = q("#ipe-ball"); if (ball) ball.classList.remove("has-result");
+        for (const id of ["#ipe-supplement","#iped-supplement"]) { const e = q(id); if (e) e.value = ""; }
+        console.log("[IPE] 注入 #"+currentIdx);
+    } catch(e) {
+        console.error("[IPE]",e);
+        setStatus("注入失败: "+e.message,"#d4726a");
+    }
+}
 
-    // 取预览区的内容（用户可能已手动编辑）
-    const previewEl = $("#ipe-preview-text");
-    const description = previewEl?.value || currentDescription;
+/* ════════════════════════════════════════
+   启动 — 等待 SillyTavern 就绪
+   ════════════════════════════════════════ */
 
-    if (!description) {
-        setStatus("没有可注入的内容", "error");
+function init() {
+    if (initialized) return;
+    try {
+        loadSettings();
+        createUI();
+        initialized = true;
+        console.log("[IPE] ✓ 图像提示词提取器已加载");
+    } catch(e) {
+        console.error("[IPE] 初始化失败:", e);
+    }
+}
+
+// 使用 SillyTavern 官方推荐的 APP_READY 事件
+// 如果 app 已就绪，绑定监听时会自动触发
+function waitAndInit() {
+    if (typeof SillyTavern === "undefined" || !SillyTavern.getContext) {
+        setTimeout(waitAndInit, 300);
         return;
     }
-
-    const tag = assembleTag(description);
-
     try {
-        injectTag(currentMessageIndex, tag);
-        setStatus("已注入 ✓", "active");
-        setButtonsEnabled(false, false);
-        setBallState("");
-
-        // 清空补充指令
-        const supEl = $("#ipe-supplement");
-        if (supEl) supEl.value = "";
-    } catch (err) {
-        console.error("[IPE] 注入失败:", err);
-        setStatus(`注入失败: ${err.message}`, "error");
+        const { eventSource, event_types } = SillyTavern.getContext();
+        eventSource.on(event_types.APP_READY, () => setTimeout(init, 100));
+    } catch(e) {
+        // 兜底：直接尝试初始化
+        setTimeout(init, 2000);
     }
 }
 
-/* ────────────────────────────────────────────
-   标签注入
-   ──────────────────────────────────────────── */
-
-function injectTag(messageIndex, tag) {
-    const context = getContext();
-    const msg = context.chat?.[messageIndex];
-
-    if (!msg) {
-        throw new Error("消息不存在");
-    }
-
-    // 追加标签到消息末尾（换行分隔）
-    msg.mes = msg.mes.trimEnd() + "\n\n" + tag;
-
-    // 保存聊天记录
-    if (typeof saveChatConditional === "function") {
-        saveChatConditional();
-    }
-
-    // 更新 DOM 显示
-    // 注意：不同 ST 版本的 DOM 结构可能不同，
-    // 如果下面的选择器不生效，请根据你的 ST 版本调整
-    const mesEl = document.querySelector(
-        `#chat .mes[mesid="${messageIndex}"] .mes_text`
-    );
-    if (mesEl) {
-        // 追加标签文本到 DOM（触发生图插件重新扫描）
-        mesEl.innerHTML = mesEl.innerHTML + `<p>${esc(tag)}</p>`;
-    }
-
-    // 尝试触发 ST 的消息更新事件，让生图插件重新扫描
-    if (typeof eventSource !== "undefined" && event_types?.MESSAGE_UPDATED) {
-        eventSource.emit(event_types.MESSAGE_UPDATED, messageIndex);
-    }
-
-    console.log(`[IPE] 标签已注入到消息 #${messageIndex}`);
-}
-
-/* ────────────────────────────────────────────
-   初始化
-   ──────────────────────────────────────────── */
-
-jQuery(async () => {
-    loadSettings();
-    createUI();
-    console.log("[IPE] 图像提示词提取器已加载");
-});
+waitAndInit();
