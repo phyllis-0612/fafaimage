@@ -1,8 +1,54 @@
 /* ============================================================
-   Image Prompt Extractor — 样式
+   Image Prompt Extractor — 样式 v1.1.0
    ============================================================ */
 
-/* ---------- 悬浮球 ---------- */
+/* ── 顶部导航栏按钮 ── */
+.ipe-topbar-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    font-size: 18px;
+    cursor: pointer;
+    transition: background 0.2s;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.ipe-topbar-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+/* 找不到顶部栏时的降级：固定在顶部右侧 */
+.ipe-topbar-fallback {
+    position: fixed;
+    top: 10px;
+    right: 12px;
+    z-index: 10001;
+    background: rgba(28, 28, 32, 0.75);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+
+.ipe-topbar-btn.processing {
+    animation: ipe-pulse 1.6s ease-in-out infinite;
+}
+
+.ipe-topbar-btn.has-result::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #6ec577;
+}
+
+/* ── 悬浮球 ── */
 .ipe-ball {
     position: fixed;
     bottom: 30px;
@@ -23,7 +69,6 @@
 .ipe-ball:hover {
     background: rgba(255, 255, 255, 0.82);
     transform: scale(1.08);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
 }
 
 .ipe-ball.processing {
@@ -44,17 +89,22 @@
 
 @keyframes ipe-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
-    50% { box-shadow: 0 0 0 10px rgba(255, 255, 255, 0); }
+    50%       { box-shadow: 0 0 0 10px rgba(255, 255, 255, 0); }
 }
 
-/* ---------- 主面板 ---------- */
+/* ── 扩展面板内嵌包裹 ── */
+.ipe-sidebar-wrap {
+    margin-top: 8px;
+}
+
+/* ── 浮动主面板（topbar / ball 模式） ── */
 .ipe-panel {
     position: fixed;
     right: 24px;
     bottom: 82px;
     width: 400px;
     max-height: 78vh;
-    background: rgba(28, 28, 32, 0.94);
+    background: rgba(28, 28, 32, 0.96);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     border-radius: 14px;
@@ -74,7 +124,7 @@
     flex-direction: column;
 }
 
-/* ---------- 面板头部 ---------- */
+/* ── 面板头部 ── */
 .ipe-panel-header {
     display: flex;
     align-items: center;
@@ -91,7 +141,7 @@
     letter-spacing: 0.3px;
 }
 
-/* ---------- 开关 ---------- */
+/* ── 开关 ── */
 .ipe-toggle {
     position: relative;
     display: inline-block;
@@ -135,23 +185,20 @@
     background: #6ec577;
 }
 
-/* ---------- 可滚动区域 ---------- */
+/* ── 可滚动区域 ── */
 .ipe-sections {
     overflow-y: auto;
     flex: 1;
     padding: 6px 0;
 }
 
-.ipe-sections::-webkit-scrollbar {
-    width: 4px;
-}
-
+.ipe-sections::-webkit-scrollbar { width: 4px; }
 .ipe-sections::-webkit-scrollbar-thumb {
     background: rgba(255, 255, 255, 0.1);
     border-radius: 2px;
 }
 
-/* ---------- 折叠区块 ---------- */
+/* ── 折叠区块 ── */
 .ipe-section {
     border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
@@ -171,9 +218,7 @@
     transition: color 0.2s;
 }
 
-.ipe-section-header:hover {
-    color: #ddd;
-}
+.ipe-section-header:hover { color: #ddd; }
 
 .ipe-collapse-icon {
     font-size: 11px;
@@ -196,7 +241,42 @@
     display: none;
 }
 
-/* ---------- 表单元素 ---------- */
+/* ── 单选组（入口模式） ── */
+.ipe-radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ipe-radio-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 12.5px;
+    color: #ccc;
+    padding: 5px 8px;
+    border-radius: 6px;
+    transition: background 0.15s;
+}
+
+.ipe-radio-label:hover {
+    background: rgba(255,255,255,0.05);
+}
+
+.ipe-radio-label input[type="radio"] {
+    accent-color: #6ec577;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+}
+
+.ipe-radio-label small {
+    color: #666;
+    font-size: 11px;
+}
+
+/* ── 表单元素 ── */
 .ipe-section-body label {
     display: flex;
     flex-direction: column;
@@ -247,20 +327,15 @@
     padding-left: 2px;
 }
 
-/* ---------- 预览区 ---------- */
+/* ── 预览区 ── */
 .ipe-preview-status {
     font-size: 11.5px;
     color: #666;
     padding: 2px 0;
 }
 
-.ipe-preview-status.active {
-    color: #6ec577;
-}
-
-.ipe-preview-status.error {
-    color: #d4726a;
-}
+.ipe-preview-status.active { color: #6ec577; }
+.ipe-preview-status.error  { color: #d4726a; }
 
 .ipe-preview-actions {
     display: flex;
@@ -268,7 +343,7 @@
     padding-top: 4px;
 }
 
-/* ---------- 按钮 ---------- */
+/* ── 按钮 ── */
 .ipe-btn {
     flex: 1;
     padding: 7px 12px;
@@ -303,14 +378,14 @@
     color: #8fd696;
 }
 
-/* ---------- iOS / 移动端适配 ---------- */
+/* ── 手机 / 安卓适配 ── */
 @media (max-width: 480px) {
     .ipe-panel {
         left: 8px;
         right: 8px;
         bottom: 78px;
         width: auto;
-        max-height: 70vh;
+        max-height: 72vh;
         border-radius: 12px;
     }
 
@@ -321,12 +396,10 @@
         height: 38px;
     }
 
-    .ipe-section-body textarea {
-        font-size: 14px; /* iOS 下小于 16px 会触发页面缩放 */
-    }
-
+    /* 防止 iOS/安卓 WebView 缩放 */
+    .ipe-section-body textarea,
     .ipe-section-body input[type="text"],
     .ipe-section-body input[type="password"] {
-        font-size: 14px;
+        font-size: 16px;
     }
 }
