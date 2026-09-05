@@ -4,6 +4,7 @@
  */
 
 const EXT_NAME = "image-prompt-extractor";
+var IPE_VERSION = "2.12.0";
 const DEFAULTS = {
     enabled: true,
     mistTheme: false,   // v1.8.7 开灯：莫兰迪雾蓝浅色皮，默认关（暗色）
@@ -47,7 +48,9 @@ const DEFAULTS = {
     ledgerStream: true,            // 2.10.0 流式接收：思考模型边想边流，中转不会因空闲把连接掐断
     ledgerIdleTimeout: 300,        // 秒。「连续多少秒一个字节都没收到」才判死；0 = 永不
     ledgerReasoningEffort: "",     // reasoning_effort；空 = 不发，用模型默认
-    ledgerMaxTokens: 0             // 输出上限；0 = 不发。思考模型发 max_completion_tokens，普通模型发 max_tokens
+    ledgerMaxTokens: 0,            // 输出上限；0 = 不发。思考模型发 max_completion_tokens，普通模型发 max_tokens
+    imgLayered: false,             // 2.11.0 分层生图：一次请求四层输出（镜头 / 环境 / 人物 / 动作）
+    imgLockCamera: false, imgLockEnv: false, imgLockMood: false, imgLockChars: false, imgLockPose: false
 };
 let currentDesc = "", currentIdx = -1, processing = false, initialized = false;
 let ipeAbortController = null;
@@ -3200,7 +3203,243 @@ function ipeTrimSourceText(text) {
     return text;
 }
 
-function buildVisionUserPrompt(text, supplement) {
+/* ============================================================
+   🎨 分层生图（2.11.0）
+   老路：一次提取吐一整段 Description，改一处全部重来，环境每楼重提会漂，
+   多人动作模型读不清谁在哪。
+   新路：还是一次请求，但让副 AI 按四个标签分节输出——
+     <camera> 镜头   <env> 环境   <mood> 氛围   <chars> 人物   <pose> 动作与空间关系
+   插件机械剥壳（跟挂账认 <ledger> 一个路子），每层一个框、一个锁：
+     · 锁住的层不重提，原样喂回去让其他层与之保持一致
+     · 环境层：场景没换时副 AI 回 NO_CHANGE，插件沿用本聊天上一楼的环境
+     · 只重摇某一层 = 其余三层临时按锁定处理
+   模板可用 {Camera} {Env} {Chars} {Pose} 单独放置；{Description} 拿没被单独放置的层。
+   老模板只写 {Description} 的照样能用，四层按顺序拼成一段。
+   ============================================================ */
+var IPE_IMG_LAYERS = ["camera", "env", "mood", "chars", "pose"];
+var IPE_IMG_LAYER_LABEL = { camera: "镜头", env: "环境", mood: "氛围", chars: "人物", pose: "动作" };
+var IPE_IMG_LAYER_ICON  = { camera: "📷", env: "🌆", mood: "🎞️", chars: "🧍", pose: "🤝" };
+var IPE_IMG_LAYER_PH    = { camera: "{Camera}", env: "{Env}", mood: "{Mood}", chars: "{Chars}", pose: "{Pose}" };
+/* 可跨楼沿用的层：环境（物理空间几十楼不换）、氛围（一段戏的基调常常连着几楼）。
+   副 AI 回 NO_CHANGE 就沿用本聊天上一楼；其他层没这个后门。 */
+var IPE_IMG_INHERIT = { env: true, mood: true };
+var IPE_IMG_LAYERS_META_KEY = "ipe_img_layers_v1";
+var IPE_IMG_NOCHANGE = "NO_CHANGE";
+var ipeImgLayersFresh = false;   // 本次预览是否来自成功分层；副 AI 没分层时为 false，注入不拿旧层框填占位符
+
+function ipeImgLayeredOn() { return cfg().imgLayered === true; }
+function ipeImgLockKey(l) { return "imgLock" + l.charAt(0).toUpperCase() + l.slice(1); }
+function ipeImgLocks(override) {
+    var out = {};
+    IPE_IMG_LAYERS.forEach(function(l){ out[l] = override ? !!override[l] : cfg()[ipeImgLockKey(l)] === true; });
+    return out;
+}
+
+/* 本聊天上一次的四层，存 chat_metadata；换聊天自然各用各的 */
+function ipeImgLayersRead() {
+    try {
+        var root = ipeMetaRoot();
+        var v = root && root[IPE_IMG_LAYERS_META_KEY];
+        if (v && typeof v === "object") return v;
+    } catch(e) {}
+    return null;
+}
+function ipeImgLayersSave(layers, floor) {
+    try {
+        var root = ipeMetaRoot(); if (!root) return;
+        var o = { floor: Number(floor) || 0, envFloor: Number(layers && layers.envFloor) || Number(floor) || 0, moodFloor: Number(layers && layers.moodFloor) || Number(floor) || 0, updatedAt: Date.now() };
+        IPE_IMG_LAYERS.forEach(function(l){ o[l] = String((layers && layers[l]) || ""); });
+        root[IPE_IMG_LAYERS_META_KEY] = o;
+        var c = ctx(); if (c && typeof c.saveMetadataDebounced === "function") c.saveMetadataDebounced();
+    } catch(e) {}
+}
+
+/* 面板里四个框此刻的值（面板优先，抽屉兜底） */
+function ipeImgLayerBoxValues() {
+    var out = {};
+    IPE_IMG_LAYERS.forEach(function(l){
+        var a = q("#ipe-layer-" + l), b = q("#iped-layer-" + l);
+        out[l] = String((a && a.value) || (b && b.value) || "").trim();
+    });
+    return out;
+}
+
+/* 喂给副 AI 的"上一楼"：环境继承只认本聊天存档（框里的值可能是别的聊天留下的）；
+   锁定层以框里的值为准——人改过再锁，就是"照这个来"。 */
+function ipeImgPrevLayers(locks) {
+    var st = ipeImgLayersRead();
+    var box = ipeImgLayerBoxValues();
+    var out = { floor: st ? Number(st.floor) || 0 : 0, envFloor: st ? Number(st.envFloor || st.floor) || 0 : 0, moodFloor: st ? Number(st.moodFloor || st.floor) || 0 : 0 };
+    IPE_IMG_LAYERS.forEach(function(l){
+        var stored = st ? String(st[l] || "").trim() : "";
+        out[l] = (locks && locks[l] && box[l]) ? box[l] : stored;
+    });
+    return out;
+}
+
+function ipeImgLayerContract(prev, locks) {
+    var lines = [
+        "任务：把正文拆成五层英文生图描述，按下面五个标签分节输出。标签外不要写任何东西；不要解释；不要标题；不要代码块；不要中文。",
+        "<camera>景别、机位高度、视角、构图、景深。一到两句。</camera>",
+        "<env>只写物理空间：地点、室内外、时间段、天气、关键背景与道具、背景人物的数量与动态。不写光线质感和情绪。两到三句。</env>",
+        "<mood>这一楼的画面感觉，用画面载体写而不是堆形容词：光的方向与质地、色温、明暗对比、空气感（清透 / 潮湿 / 尘光）、天气细节、整体基调。一到三句。</mood>",
+        "<chars>只写本楼实际出场且入镜的角色：按角色锚点校准外貌，再写此刻的服装状态、表情、身体状态（受伤、湿发、绷带等）。</chars>",
+        "<pose>动作与空间关系，写成明确的空间句：谁在哪、面朝哪、视线落在哪、手放在哪、身体接触点、相对位置与距离。</pose>"
+    ];
+    var lockLines = [];
+    IPE_IMG_LAYERS.forEach(function(l){
+        if (locks && locks[l] && prev && String(prev[l] || "").trim()) lockLines.push("<" + l + ">" + prev[l] + "</" + l + ">");
+    });
+    if (lockLines.length) {
+        lines.push("");
+        lines.push("【已锁定的层 · 原样沿用，不要重写】");
+        lines.push(lockLines.join("\n"));
+        lines.push("锁定层只输出 " + IPE_IMG_NOCHANGE + " 即可；其余层必须与锁定层保持一致（同一空间、同一光线、同一批人）。");
+    }
+    if (prev && String(prev.env || "").trim() && !(locks && locks.env)) {
+        lines.push("");
+        lines.push("【上一楼的环境层】");
+        lines.push(prev.env);
+        lines.push("本楼地点、时间段、天气、道具都没变时，<env> 里只写 " + IPE_IMG_NOCHANGE + "，其余层照常输出。换了场景才重写环境。");
+    }
+    if (prev && String(prev.mood || "").trim() && !(locks && locks.mood)) {
+        lines.push("");
+        lines.push("【上一楼的氛围层】");
+        lines.push(prev.mood);
+        lines.push("本楼光线、色温、情绪基调都没变时，<mood> 里只写 " + IPE_IMG_NOCHANGE + "。情绪转折、光线变化就重写。");
+    }
+    return lines.join("\n");
+}
+
+/* 机械剥壳：四个标签各取一段。漏闭标签就取到下一个开标签或末尾；大小写、空格都容忍。 */
+function ipeImgParseLayers(txt) {
+    var s0 = String(txt || "").replace(/^\s*```[a-zA-Z]*\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+    var out = { found: 0 };
+    IPE_IMG_LAYERS.forEach(function(l){
+        var re = new RegExp("<\\s*" + l + "\\s*>([\\s\\S]*?)(?:<\\s*\\/\\s*" + l + "\\s*>|(?=<\\s*(?:camera|env|mood|chars|pose)\\s*>)|$)", "i");
+        var m = s0.match(re);
+        if (m) { out[l] = String(m[1] || "").trim(); out.found++; }
+        else out[l] = "";
+    });
+    return out;
+}
+
+function ipeImgIsNoChange(v) { return String(v || "").replace(/\s+/g, "").toUpperCase() === IPE_IMG_NOCHANGE; }
+
+/* 合账：锁定层用旧值；NO_CHANGE 或空 → 有旧值就沿用；否则收新值 */
+function ipeImgMergeLayers(parsed, prev, locks, floor) {
+    var out = { notes: [], envFloor: Number(floor) || 0, moodFloor: Number(floor) || 0 };
+    IPE_IMG_LAYERS.forEach(function(l){
+        var v = String((parsed && parsed[l]) || "").trim();
+        var prevV = prev ? String(prev[l] || "").trim() : "";
+        var label = IPE_IMG_LAYER_LABEL[l] || l;
+        var fk = l + "Floor";                                   // envFloor / moodFloor：这层内容来自哪一楼
+        var prevFloor = prev ? (Number(prev[fk]) || Number(prev.floor) || 0) : 0;
+        if (locks && locks[l] && prevV) { out[l] = prevV; if (IPE_IMG_INHERIT[l]) out[fk] = prevFloor; return; }
+        if (!v || ipeImgIsNoChange(v)) {
+            if (prevV) {
+                out[l] = prevV;
+                if (IPE_IMG_INHERIT[l]) { out[fk] = prevFloor; out.notes.push(label + "沿用第 " + prevFloor + " 楼"); }
+                else out.notes.push(label + "层沿用上一楼");
+            } else {
+                out[l] = "";
+                out.notes.push(label + "层为空");
+            }
+            return;
+        }
+        out[l] = v;
+    });
+    return out;
+}
+
+function ipeImgJoinLayers(layers, skip) {
+    var parts = [];
+    IPE_IMG_LAYERS.forEach(function(l){
+        if (skip && skip[l]) return;
+        var v = String((layers && layers[l]) || "").trim();
+        if (v) parts.push(v);
+    });
+    return parts.join(" ");
+}
+
+function ipeImgSetLayerBoxes(layers) {
+    IPE_IMG_LAYERS.forEach(function(l){
+        ["ipe-layer-", "iped-layer-"].forEach(function(pre){
+            var el = q("#" + pre + l); if (el) el.value = String((layers && layers[l]) || "");
+        });
+    });
+}
+
+/* 面板 / 抽屉：四行框 + 锁 + 只重摇这层 */
+function ipeImgLayerRowsHTML(prefix, drawer) {
+    var h = "";
+    IPE_IMG_LAYERS.forEach(function(l){
+        var label = IPE_IMG_LAYER_ICON[l] + " " + IPE_IMG_LAYER_LABEL[l];
+        if (drawer) {
+            h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px">'
+               + '<span style="font-size:12px">' + label + '</span>'
+               + '<span style="display:flex;gap:8px;align-items:center;font-size:12px">'
+               + '<label style="display:inline-flex;align-items:center;gap:4px">🔒 锁 <input type="checkbox" id="' + prefix + '-lock-' + l + '"></label>'
+               + '<input type="button" id="' + prefix + '-reroll-' + l + '" class="menu_button" value="只重摇这层">'
+               + '</span></div>'
+               + '<textarea id="' + prefix + '-layer-' + l + '" class="text_pole" rows="2"></textarea>';
+        } else {
+            h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;color:#888;font-size:12px">'
+               + '<span>' + label + '</span>'
+               + '<span style="display:flex;gap:8px;align-items:center">'
+               + '<label style="display:flex;flex-direction:row;align-items:center;gap:4px">🔒 锁 <input type="checkbox" id="' + prefix + '-lock-' + l + '"></label>'
+               + '<button type="button" id="' + prefix + '-reroll-' + l + '" class="ipe-btn" style="flex:none;padding:2px 8px">只重摇这层</button>'
+               + '</span></div>'
+               + '<textarea id="' + prefix + '-layer-' + l + '" rows="2"></textarea>';
+        }
+    });
+    return h;
+}
+
+function ipeImgRefreshLayerUI() {
+    var on = ipeImgLayeredOn();
+    ["ipe-layered", "iped-layered"].forEach(function(id){ var el = q("#" + id); if (el) el.checked = on; });
+    ["ipe-layers-box", "iped-layers-box"].forEach(function(id){ var el = q("#" + id); if (el) el.style.display = on ? "" : "none"; });
+    IPE_IMG_LAYERS.forEach(function(l){
+        ["ipe-lock-", "iped-lock-"].forEach(function(pre){
+            var el = q("#" + pre + l); if (el) el.checked = cfg()[ipeImgLockKey(l)] === true;
+        });
+    });
+    var st = ipeImgLayersRead();
+    ipeImgSetLayerBoxes(st || {});
+}
+
+function ipeImgBindLayerUI() {
+    ["ipe-layered", "iped-layered"].forEach(function(id){
+        var el = q("#" + id); if (!el || el.__ipeBound) return; el.__ipeBound = true;
+        el.addEventListener("change", function(){
+            save("imgLayered", !!el.checked);
+            ipeImgRefreshLayerUI();
+            setStatus(el.checked ? "分层提取已开：镜头 / 环境 / 氛围 / 人物 / 动作，各一框一锁" : "分层提取已关，回到整段 Description", "#6ec577");
+        });
+    });
+    IPE_IMG_LAYERS.forEach(function(l){
+        ["ipe", "iped"].forEach(function(pre){
+            var lk = q("#" + pre + "-lock-" + l);
+            if (lk && !lk.__ipeBound) { lk.__ipeBound = true; lk.addEventListener("change", function(){
+                save(ipeImgLockKey(l), !!lk.checked);
+                var o = q("#" + (pre === "ipe" ? "iped" : "ipe") + "-lock-" + l); if (o) o.checked = lk.checked;
+                setStatus((lk.checked ? "已锁定" : "已解锁") + IPE_IMG_LAYER_LABEL[l] + "层" + (lk.checked ? "：之后提取原样沿用框里这段" : ""), "#6ec577");
+            }); }
+            var rr = q("#" + pre + "-reroll-" + l);
+            if (rr && !rr.__ipeBound) { rr.__ipeBound = true; rr.addEventListener("click", function(){ onRerollLayer(l); }); }
+            var ta = q("#" + pre + "-layer-" + l);
+            if (ta && !ta.__ipeBound) { ta.__ipeBound = true; ta.addEventListener("input", function(){
+                var o = q("#" + (pre === "ipe" ? "iped" : "ipe") + "-layer-" + l); if (o && o !== ta) o.value = ta.value;
+                var joined = ipeImgJoinLayers(ipeImgLayerBoxValues());
+                ipeImgLayersFresh = true;
+                currentDesc = joined; setPreview(joined);
+            }); }
+        });
+    });
+}
+
+function buildVisionUserPrompt(text, supplement, lockOverride) {
     var c = cfg();
     var user = "";
 
@@ -3215,6 +3454,12 @@ function buildVisionUserPrompt(text, supplement) {
     user += "【正文内容】\n" + ipeTrimSourceText(text);
 
     if (supplement) user += "\n\n【补充指令】\n" + supplement;
+
+    if (ipeImgLayeredOn()) {
+        var locks = ipeImgLocks(lockOverride);
+        user += "\n\n" + ipeImgLayerContract(ipeImgPrevLayers(locks), locks);
+        return user;
+    }
 
     user += "\n\n任务：把正文转成英文生图 Description。\n";
     user += "要求：只输出最终英文 Description；不要解释；不要标题；不要代码块；不要中文；不要复述任务。\n";
@@ -3245,7 +3490,7 @@ function ipeAbortCurrentRequest() {
     }
 }
 
-async function callAPI(text, supplement) {
+async function callAPI(text, supplement, lockOverride) {
     var c = cfg();
     if (!c.apiEndpoint) throw new Error("请先配置 API 地址");
     if (!c.model) throw new Error("请先加载并选择模型");
@@ -3268,7 +3513,7 @@ async function callAPI(text, supplement) {
         model: c.model,
         messages: [
             { role: "system", content: systemPrompt },
-            { role: "user", content: buildVisionUserPrompt(text, supplement || "") }
+            { role: "user", content: buildVisionUserPrompt(text, supplement || "", lockOverride) }
         ],
         temperature: 0.4,
         stream: false
@@ -3421,7 +3666,7 @@ function ipeShowApiFailurePopup(msg, willRetry) {
     }
 }
 
-function ipeScheduleApiRetry(text, supplement, autoInjectNow, targetIdx, retryAttempt, msg) {
+function ipeScheduleApiRetry(text, supplement, autoInjectNow, targetIdx, retryAttempt, msg, lockOverride) {
     ipeClearApiRetry();
     retryAttempt = Number(retryAttempt || 0);
     if (retryAttempt >= 1) {
@@ -3458,7 +3703,7 @@ function ipeScheduleApiRetry(text, supplement, autoInjectNow, targetIdx, retryAt
                 }
             }
             setStatus("正在自动重试 API 请求…", "#6ec577");
-            runExtract(text, supplement || "", autoInjectNow, targetIdx, retryAttempt + 1);
+            runExtract(text, supplement || "", autoInjectNow, targetIdx, retryAttempt + 1, lockOverride);
         } catch(e) {
             setStatus("自动重试启动失败：" + e.message, "#d4726a");
         }
@@ -3470,7 +3715,8 @@ function createUI() {
     createPanel();
     createDrawer();
     bindAll();
-    setTimeout(function(){ ipeRefreshApiProfileEditors(); ipeRefreshSystemPromptEditors(); ipeRefreshTemplateEditors(); ipeRefreshAnchorEditors(); ipeRefreshRuleEditors(); ipeSetStopButtonsState(!!ipeAbortController); }, 120);
+    setTimeout(function(){ ipeRefreshApiProfileEditors(); ipeRefreshSystemPromptEditors(); ipeRefreshTemplateEditors(); ipeRefreshAnchorEditors(); ipeRefreshRuleEditors(); ipeSetStopButtonsState(!!ipeAbortController); try { ipeImgBindLayerUI(); ipeImgRefreshLayerUI(); } catch(eL) {} try { ipeInstallZoomButtons(); } catch(eZ) {} }, 120);
+    setTimeout(function(){ try { ipeInstallZoomButtons(); } catch(eZ) {} }, 2500);   // 抽屉晚到也补上
     setTimeout(function(){ ipeSetActiveTab(cfg().activeTab || "image"); ipeLedgerSync(); ipeLedgerInstallInlineObserver(); }, 160);
 }
 
@@ -3922,7 +4168,14 @@ function createPanel() {
             '<button id="ipe-template-delete" class="ipe-btn" type="button">删除当前</button>'+
         '</div>'+
         '<textarea id="ipe-base-template" rows="6" placeholder="image###...{Description}...###"></textarea>'+
-        '<div class="ipe-hint">可无限新增模板。用 {Description} 标记描述文本的插入位置</div>');
+        '<div class="ipe-hint">可无限新增模板。用 {Description} 标记描述文本的插入位置；分层模式可用 {Camera} {Env} {Mood} {Chars} {Pose}</div>'+
+        '<div class="ipe-preview-actions" style="margin-top:8px">'+
+            '<button id="ipe-pack-export" class="ipe-btn" type="button">\u2B07 导出全部预设包</button>'+
+            '<button id="ipe-pack-export-cur" class="ipe-btn" type="button">\u2B07 只导出当前这套</button>'+
+            '<button id="ipe-pack-import" class="ipe-btn" type="button">\u2B06 导入预设包</button>'+
+        '</div>'+
+        '<input type="file" id="ipe-pack-file" accept=".json,application/json" style="display:none">'+
+        '<div class="ipe-hint">包里装：模板 / 提取规则 / 系统提示 / 角色锚点 / 通用锚点规则，不含 API 与密钥。导入按名字合并：新名字追加，同名覆盖前会问一句。「只导出当前这套」= 当前选中的模板、规则、系统提示、锚点各一份，发给别人用这个。</div>');
 
     h += secHTML("char-anchors","角色锚点", true,
         '<label>锚点预设<select id="ipe-anchor-slot"></select></label>'+
@@ -3957,7 +4210,12 @@ function createPanel() {
     h += secHTML("preview","预览", false,
         '<div style="margin-bottom:6px;color:#888;font-size:12px"><label style="display:flex;align-items:center;gap:6px;flex-direction:row">显示快捷入口 <input type=\"checkbox\" id=\"ipe-show-quick-entry\"'+(c.showQuickEntry?' checked':'')+'></label></div>'+
         '<div style="margin-bottom:6px;color:#888;font-size:12px"><label style="display:flex;align-items:center;gap:6px;flex-direction:row">自动注入 <input type="checkbox" id="ipe-auto-inject"'+(c.autoInject?' checked':'')+'></label></div>'+
+        '<div style="margin-bottom:6px;color:#888;font-size:12px"><label style="display:flex;align-items:center;gap:6px;flex-direction:row">分层提取（镜头 / 环境 / 氛围 / 人物 / 动作） <input type="checkbox" id="ipe-layered"></label></div>'+
         '<div id="ipe-status" class="ipe-preview-status">等待新消息…</div>'+
+        '<div id="ipe-layers-box" style="display:none">'+
+            ipeImgLayerRowsHTML("ipe", false)+
+            '<div class="ipe-hint" style="margin-top:6px">锁住的层不重提，原样沿用框里那段；「只重摇这层」= 其余各层临时锁定。场景没换时环境层、基调没变时氛围层，自动沿用本聊天上一楼。模板可用 {Camera} {Env} {Mood} {Chars} {Pose} 单独放置，{Description} 拿剩下的层；只写 {Description} 就是五层拼成一段。下面这框是拼好的整段，直接改也行。</div>'+
+        '</div>'+
         '<textarea id="ipe-preview-text" rows="6" placeholder="生成的 Description 将显示在这里…"></textarea>'+
         '<label>补充指令<input type="text" id="ipe-supplement" placeholder="例：这段是冷战不是撒娇"></label>'+
         '<div class="ipe-preview-actions">'+
@@ -4087,7 +4345,7 @@ function createPanel() {
         '</div></details>',
         "ledger");
 
-    h += '</div><div class="ipe-footer">by ' + IPE_CREDITS + '</div>';
+    h += '</div><div class="ipe-footer">by ' + IPE_CREDITS + ' \u00B7 v' + IPE_VERSION + '</div>';
     panel.innerHTML = h;
     ipeRootDocument().body.appendChild(panel);
     ipeApplyTheme();
@@ -4133,7 +4391,10 @@ function createDrawer() {
     h += '<label>模板名称</label><input type="text" id="iped-template-name" class="text_pole" value="" placeholder="例如：乙游CG">';
     h += '<div style="display:flex;gap:6px;margin-top:6px"><input type="button" id="iped-template-add" class="menu_button" value="新增模板"><input type="button" id="iped-template-delete" class="menu_button" value="删除当前"></div>';
     h += '<textarea id="iped-base-template" class="text_pole" rows="5" placeholder="image###...{Description}...###"></textarea>';
-    h += '<small style="color:#888">可无限新增模板。用 {Description} 标记插入位置</small>';
+    h += '<small style="color:#888">可无限新增模板。用 {Description} 标记插入位置；分层可用 {Camera} {Env} {Mood} {Chars} {Pose}</small>';
+    h += '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><input type="button" id="iped-pack-export" class="menu_button" value="\u2B07 导出全部预设包"><input type="button" id="iped-pack-export-cur" class="menu_button" value="\u2B07 只导出当前这套"><input type="button" id="iped-pack-import" class="menu_button" value="\u2B06 导入预设包"></div>';
+    h += '<input type="file" id="iped-pack-file" accept=".json,application/json" style="display:none">';
+    h += '<small style="color:#888">包里装模板 / 规则 / 系统提示 / 锚点 / 通用锚点规则，不含 API 与密钥；导入按名字合并，同名覆盖前会问。</small>';
     h += '<hr><small><b>角色锚点</b></small>';
     h += '<label>锚点预设</label><select id="iped-anchor-slot" class="text_pole"></select>';
     h += '<label>锚点名称</label><input type="text" id="iped-anchor-name" class="text_pole" value="" placeholder="例如：陆星河 / 苑无忧">';
@@ -4146,7 +4407,10 @@ function createDrawer() {
     h += '<div style="display:flex;gap:6px;margin-top:6px"><input type="button" id="iped-rule-add" class="menu_button" value="新增规则"><input type="button" id="iped-rule-delete" class="menu_button" value="删除当前"></div>';
     h += '<textarea id="iped-extract-rules" class="text_pole" rows="4" placeholder="例：输出英文自然语言描述；不要参数；不要解释；适配当前生图模型..."></textarea>';
     h += '<hr><small><b>预览</b></small>';
+    h += '<div style="margin:6px 0"><label>分层提取（镜头 / 环境 / 氛围 / 人物 / 动作） <input type="checkbox" id="iped-layered"></label></div>';
     h += '<div id="iped-status" style="color:#888;font-size:12px;margin:4px 0">等待新消息…</div>';
+    h += '<div id="iped-layers-box" style="display:none">' + ipeImgLayerRowsHTML("iped", true)
+       + '<small style="color:#888">锁住的层不重提；「只重摇这层」= 其余各层临时锁定。环境 / 氛围没变时沿用上一楼。模板可用 {Camera} {Env} {Mood} {Chars} {Pose}，{Description} 拿剩下的层。</small></div>';
     h += '<textarea id="iped-preview-text" class="text_pole" rows="5" placeholder="生成的 Description 将显示在这里…"></textarea>';
     h += '<label>补充指令</label><input type="text" id="iped-supplement" class="text_pole" placeholder="例：这段是冷战不是撒娇">';
     h += '<div style="display:flex;gap:6px;margin-top:6px">';
@@ -4305,6 +4569,340 @@ function ipeForceSaveFromEditors() {
         console.error("[IPE] force save failed:", e);
         setStatus("保存失败", "#d4726a");
     }
+}
+
+/* ============================================================
+   📦 生图预设包（2.12.0）
+   一个 JSON 装五样：模板 / 提取规则 / 系统提示 / 角色锚点 / 通用锚点规则。
+   不带 API 地址和密钥——分享给别人的时候不能把 key 送出去。
+   导入按名字合并：新名字追加，同名覆盖（覆盖前问一句），绝不清空对方已有的。
+   系统提示固定两槽（情感 / 剧情），按 id 对位，对不上再按名字。
+   ============================================================ */
+var IPE_IMG_PACK_FMT = "ipe-image-pack";
+
+function ipeImgPackBuild(scope) {
+    var onlyCur = scope === "current";
+    function pick(list, activeId) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var it = list[i]; if (!it) continue;
+            if (onlyCur && it.id !== activeId) continue;
+            out.push({ id: it.id, name: it.name, value: String(it.value || "") });
+        }
+        return out;
+    }
+    var guide = String(cfg().anchorUsageGuide || "").trim();   // 只导出用户自己改过的；没改过就不带，导入方保留自己的默认
+    return {
+        _fmt: IPE_IMG_PACK_FMT, _v: 1,
+        exportedAt: new Date().toISOString(),
+        pluginVersion: IPE_VERSION,
+        scope: onlyCur ? "current" : "all",
+        templates:     pick(ipeGetBaseTemplates(),      ipeGetActiveTemplateId()),
+        rules:         pick(ipeGetRulePresets(),        ipeGetActiveRuleId()),
+        systemPrompts: pick(ipeGetSystemPromptPresets(), ipeGetActiveSystemPromptId()),
+        anchors:       pick(ipeGetAnchorPresets(),      ipeGetActiveAnchorId()),
+        anchorGuide:   guide
+    };
+}
+
+function ipeToast(msg, ok) {
+    try {
+        var w = ipeRootWindow();
+        var t = w && (w.toastr || (w.parent && w.parent.toastr));
+        if (t && typeof t[ok ? "success" : "error"] === "function") {
+            t[ok ? "success" : "error"](msg, "🐚 小海螺", { timeOut: ok ? 6000 : 9000, extendedTimeOut: 2000, closeButton: true });
+        }
+    } catch(e) {}
+    try { setStatus(msg, ok ? "#6ec577" : "#d4726a"); } catch(e) {}
+}
+
+function ipeImgPackExport(scope) {
+    var pack = ipeImgPackBuild(scope);
+    var n = pack.templates.length + pack.rules.length + pack.systemPrompts.length + pack.anchors.length;
+    var name = "ipe-image-pack-" + (pack.scope === "current" ? "current-" : "") + new Date().toISOString().slice(0, 10) + ".json";
+    try {
+        var blob = new Blob([JSON.stringify(pack, null, 2)], { type: "application/json" });
+        var url  = URL.createObjectURL(blob);
+        var a    = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click();
+        setTimeout(function(){ try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch(e){} }, 200);
+        ipeToast("已导出 " + name + "：模板 " + pack.templates.length + " / 规则 " + pack.rules.length
+            + " / 系统提示 " + pack.systemPrompts.length + " / 锚点 " + pack.anchors.length + (pack.anchorGuide ? " / 通用锚点规则" : "") + "（不含 API 与密钥）", true);
+        return true;
+    } catch(e) {
+        ipeToast("导出失败：" + (e && e.message ? e.message : String(e)), false);
+        return false;
+    }
+}
+
+/* 按名字合并一类预设。返回 { added, replaced } */
+function ipeImgPackMergeList(cur, incoming, prefix, opts) {
+    var added = 0, replaced = 0;
+    var byName = {}, byId = {};
+    for (var i = 0; i < cur.length; i++) { byName[String(cur[i].name || "").trim()] = cur[i]; byId[cur[i].id] = cur[i]; }
+    for (var j = 0; j < (incoming || []).length; j++) {
+        var it = incoming[j]; if (!it || typeof it !== "object") continue;
+        var name = String(it.name || "").trim(); var value = String(it.value == null ? "" : it.value);
+        if (!name && !value) continue;
+        var hit = null;
+        if (opts && opts.matchIdFirst && it.id && byId[it.id]) hit = byId[it.id];
+        if (!hit && name && byName[name]) hit = byName[name];
+        if (hit) {
+            if (String(hit.value || "") !== value) { hit.value = value; replaced++; }
+        } else if (opts && opts.fixedSlots) {
+            continue;                                   // 系统提示只有两槽，对不上号就不硬塞
+        } else {
+            var nu = { id: ipeMakeId(prefix), name: name || (prefix + "_" + (cur.length + 1)), value: value };
+            cur.push(nu); byName[nu.name] = nu; byId[nu.id] = nu; added++;
+        }
+    }
+    return { added: added, replaced: replaced };
+}
+
+/* 先干跑数一数要覆盖多少，再决定问不问 */
+function ipeImgPackPreview(pack) {
+    function count(cur, incoming, opts) {
+        var byName = {}, byId = {}, add = 0, rep = 0;
+        cur.forEach(function(c){ byName[String(c.name || "").trim()] = c; byId[c.id] = c; });
+        (incoming || []).forEach(function(it){
+            if (!it || typeof it !== "object") return;
+            var name = String(it.name || "").trim(); var value = String(it.value == null ? "" : it.value);
+            if (!name && !value) return;
+            var hit = (opts && opts.matchIdFirst && it.id && byId[it.id]) || (name && byName[name]) || null;
+            if (hit) { if (String(hit.value || "") !== value) rep++; }
+            else if (!(opts && opts.fixedSlots)) add++;
+        });
+        return { added: add, replaced: rep };
+    }
+    return {
+        templates: count(ipeGetBaseTemplates(), pack.templates),
+        rules: count(ipeGetRulePresets(), pack.rules),
+        systemPrompts: count(ipeGetSystemPromptPresets(), pack.systemPrompts, { matchIdFirst: true, fixedSlots: true }),
+        anchors: count(ipeGetAnchorPresets(), pack.anchors)
+    };
+}
+
+function ipeImgPackNormalize(parsed) {
+    if (Array.isArray(parsed)) return { _fmt: IPE_IMG_PACK_FMT, templates: parsed };     // 裸数组当模板表
+    if (!parsed || typeof parsed !== "object") return null;
+    if (parsed._fmt && parsed._fmt !== IPE_IMG_PACK_FMT) return null;
+    var has = ["templates", "rules", "systemPrompts", "anchors", "anchorGuide"].some(function(k){ return k in parsed; });
+    return has ? parsed : null;
+}
+
+function ipeImgPackImportText(txt, opts) {
+    opts = opts || {};
+    var parsed;
+    try { parsed = JSON.parse(String(txt || "")); }
+    catch(e) { ipeToast("导入失败：这不是合法 JSON", false); return null; }
+    var pack = ipeImgPackNormalize(parsed);
+    if (!pack) { ipeToast("导入失败：这不是小海螺的生图预设包（也不是模板数组）", false); return null; }
+
+    var pv = ipeImgPackPreview(pack);
+    var totalRep = pv.templates.replaced + pv.rules.replaced + pv.systemPrompts.replaced + pv.anchors.replaced;
+    var totalAdd = pv.templates.added + pv.rules.added + pv.systemPrompts.added + pv.anchors.added;
+    var guideIn = String(pack.anchorGuide || "").trim();
+    var guideChange = !!guideIn && guideIn !== String(cfg().anchorUsageGuide || "").trim();
+    if (!opts.force && (totalRep > 0 || guideChange)) {
+        var msg = "这个包会覆盖你 " + totalRep + " 个同名预设"
+            + (pv.templates.replaced ? "（模板 " + pv.templates.replaced + "）" : "")
+            + (pv.rules.replaced ? "（规则 " + pv.rules.replaced + "）" : "")
+            + (pv.systemPrompts.replaced ? "（系统提示 " + pv.systemPrompts.replaced + "）" : "")
+            + (pv.anchors.replaced ? "（锚点 " + pv.anchors.replaced + "）" : "")
+            + (guideChange ? "，并替换通用锚点规则" : "")
+            + "；另新增 " + totalAdd + " 个。\n继续吗？（取消 = 什么都不动）";
+        var okc = true;
+        try { var rw = ipeRootWindow(); if (rw && typeof rw.confirm === "function") okc = rw.confirm(msg); } catch(e) {}
+        if (!okc) { ipeToast("已取消导入，什么都没动", false); return null; }
+    }
+
+    var tpl = ipeGetBaseTemplates(), rul = ipeGetRulePresets(), sys = ipeGetSystemPromptPresets(), anc = ipeGetAnchorPresets();
+    var r1 = ipeImgPackMergeList(tpl, pack.templates, "tpl");
+    var r2 = ipeImgPackMergeList(rul, pack.rules, "rule");
+    var r3 = ipeImgPackMergeList(sys, pack.systemPrompts, "sys", { matchIdFirst: true, fixedSlots: true });
+    var r4 = ipeImgPackMergeList(anc, pack.anchors, "anchor");
+    ipeSaveBaseTemplates(tpl); ipeSaveRulePresets(rul); ipeSaveSystemPromptPresets(sys); ipeSaveAnchorPresets(anc);
+    if (guideChange) {
+        ipeSetAnchorUsageGuide(guideIn === IPE_DEFAULT_ANCHOR_USAGE_GUIDE ? "" : guideIn);
+        ["ipe-anchor-guide-editor","iped-anchor-guide-editor"].forEach(function(id){ var el = q("#" + id); if (el) el.value = ipeGetAnchorUsageGuide(); });
+    }
+    try { ipeSaveNow(); } catch(e) {}
+    try { ipeRefreshTemplateEditors(); ipeRefreshRuleEditors(); ipeRefreshSystemPromptEditors(); ipeRefreshAnchorEditors(); } catch(e) {}
+
+    var sum = { templates: r1, rules: r2, systemPrompts: r3, anchors: r4, guide: guideChange };
+    function fmt(label, r) { return (r.added || r.replaced) ? label + " +" + r.added + "/覆盖" + r.replaced : ""; }
+    var parts = [fmt("模板", r1), fmt("规则", r2), fmt("系统提示", r3), fmt("锚点", r4), guideChange ? "通用锚点规则已替换" : ""].filter(Boolean);
+    ipeToast(parts.length ? "已导入 ✓ " + parts.join("，") : "包是空的或与现有内容完全一致，什么都没变", true);
+    return sum;
+}
+
+/* ============================================================
+   ⤢ 放大编辑（2.11.2）
+   酒馆世界书那种：每个文本框右上角一个 ⤢，点开全屏编辑框，边打边回填，
+   回填走 input 事件，原有的预设保存 / 面板抽屉同步 / 层框重拼全部照常触发。
+   完成、点遮罩、Esc 都关；关的时候补发一次 change。
+   ============================================================ */
+var IPE_ZOOM_TITLES = {
+    "ipe-system-prompt": "系统提示", "ipe-base-template": "基础模板", "ipe-char-anchors": "角色锚点",
+    "ipe-anchor-guide-editor": "通用锚点规则", "ipe-extract-rules": "提取规则", "ipe-preview-text": "生图描述（整段）",
+    "ipe-layer-camera": "📷 镜头层", "ipe-layer-env": "🌆 环境层", "ipe-layer-mood": "🎞️ 氛围层",
+    "ipe-layer-chars": "🧍 人物层", "ipe-layer-pose": "🤝 动作层",
+    "ipe-ledger-text": "账本", "ipe-ledger-order": "User 指令", "ipe-ledger-extra": "这次额外说一句",
+    "ipe-ledger-preview": "副 AI 刚才说了什么", "ipe-ledger-prompt": "挂账规则", "ipe-ledger-note": "本卡要点 / 世界观硬设定"
+};
+function ipeZoomTitleFor(ta) {
+    try {
+        var id = String(ta.id || "").replace(/^iped-/, "ipe-");
+        if (IPE_ZOOM_TITLES[id]) return IPE_ZOOM_TITLES[id];
+        var holder = (ta.parentNode && ta.parentNode.classList && ta.parentNode.classList.contains("ipe-zoom-wrap")) ? ta.parentNode : ta;
+        var lab = (holder.parentNode && holder.parentNode.tagName === "LABEL") ? holder.parentNode : null;
+        if (!lab && holder.previousElementSibling && holder.previousElementSibling.tagName === "LABEL") lab = holder.previousElementSibling;
+        if (lab) {
+            var t = "";
+            for (var i = 0; i < lab.childNodes.length; i++) if (lab.childNodes[i].nodeType === 3) t += lab.childNodes[i].textContent;
+            t = t.trim(); if (t) return t;
+        }
+        var ph = ta.getAttribute("placeholder"); if (ph) return ph.split(/[\n；;。]/)[0].slice(0, 30);
+    } catch(e) {}
+    return "编辑";
+}
+function ipeZoomClose() {
+    try {
+        var d = ipeRootDocument(); var ov = d.getElementById("ipe-zoom-overlay");
+        if (!ov) return;
+        if (ov.__ipeKey) d.removeEventListener("keydown", ov.__ipeKey);
+        if (ov.parentNode) ov.parentNode.removeChild(ov);
+    } catch(e) {}
+    try {
+        var ball = q("#ipe-chat-quick-entry");
+        if (ball && "__ipeZoomPrevVis" in ball) {
+            ball.style.removeProperty("visibility");
+            if (ball.__ipeZoomPrevVis) ball.style.visibility = ball.__ipeZoomPrevVis;
+            delete ball.__ipeZoomPrevVis;
+        }
+    } catch(e) {}
+}
+function ipeZoomOpen(ta) {
+    if (!ta) return;
+    var d = ipeRootDocument();
+    ipeZoomClose();
+    var mist = cfg().mistTheme === true;
+    var ov = d.createElement("div");
+    ov.id = "ipe-zoom-overlay";
+    ov.className = "ipe-zoom-overlay" + (mist ? " ipe-mist" : "");
+    /* 关键样式全部内联：酒馆会缓存扩展的 style.css，更新后 JS 是新的、CSS 可能还是旧的，
+       只靠外部 CSS 的话弹窗会变成一个躺在页面底部看不见的 div。外部 CSS 只做锦上添花。 */
+    ov.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;min-height:100%;background:" + (mist ? "rgba(70,82,94,.38)" : "rgba(0,0,0,.55)") + ";"
+        + "display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;margin:0;transform:none";
+    /* 面板自己被强制到 2147483646 !important（ipeHardOpenPanel），弹窗必须再高一级且同样 important，否则压在面板底下 */
+    try { ov.style.setProperty("z-index", "2147483647", "important"); } catch(e) { ov.style.zIndex = "2147483647"; }
+    try {
+        var ball0 = q("#ipe-chat-quick-entry");
+        if (ball0) { ball0.__ipeZoomPrevVis = ball0.style.visibility; ball0.style.setProperty("visibility", "hidden", "important"); }
+    } catch(e) {}
+    /* 开灯皮跟面板同一套：莫兰迪雾蓝 #7C93A6 / 深汀 #5E7A92 / 正文 #4A5662 */
+    var boxBg = mist ? "linear-gradient(168deg, rgba(243,245,248,.99) 0%, rgba(235,239,244,.99) 48%, rgba(228,233,239,.99) 100%)" : "rgba(28,28,32,.98)";
+    var fg = mist ? "#4A5662" : "#d4d4d4";
+    var taBg = mist ? "rgba(255,255,255,.72)" : "rgba(255,255,255,.05)";
+    var bd = mist ? "rgba(140,156,172,.32)" : "rgba(255,255,255,.1)";
+    var headBg = mist ? "linear-gradient(90deg, rgba(196,216,232,.55) 0%, rgba(214,208,232,.40) 100%)" : "transparent";
+    var closeCss = mist
+        ? "border:1px solid rgba(124,147,166,.55);background:rgba(124,147,166,.18);color:#5E7A92"
+        : "border:1px solid rgba(110,197,119,.45);background:rgba(110,197,119,.18);color:#6ec577";
+    var small = false;
+    try { var rw = ipeRootWindow(); small = !!(rw && rw.innerWidth && rw.innerWidth <= 480); } catch(e) {}
+    ov.innerHTML = '<div class="ipe-zoom-box" style="width:' + (small ? '100%' : 'min(920px,100%)') + ';height:' + (small ? '100%' : 'min(86vh,100%)')
+        + ';background:' + boxBg + ';color:' + fg + ';border:1px solid ' + bd + ';border-radius:' + (small ? '0' : '14px') + (mist ? ';box-shadow:0 10px 40px rgba(84,100,116,.28),0 0 0 1px rgba(255,255,255,.55)' : '')
+        + ';display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 50px rgba(0,0,0,.5);font-family:-apple-system,\'PingFang SC\',\'Microsoft YaHei\',sans-serif;font-size:13px;box-sizing:border-box">'
+        + '<div class="ipe-zoom-head" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid ' + bd + ';flex-shrink:0;background:' + headBg + '">'
+        + '<span class="ipe-zoom-title" style="font-weight:600;font-size:14px;color:' + (mist ? '#46525E' : '#e8e8e8') + '"></span>'
+        + '<span class="ipe-zoom-count" style="font-size:11px;opacity:.7;margin-left:auto"></span>'
+        + '<button type="button" class="ipe-zoom-close" style="padding:6px 14px;border-radius:8px;' + closeCss + ';cursor:pointer;font-size:13px;font-family:inherit">完成</button></div>'
+        + '<textarea class="ipe-zoom-ta" spellcheck="false" style="flex:1;margin:' + (small ? '8px' : '12px') + ';padding:12px;background:' + taBg + ';color:' + fg + ';border:1px solid ' + bd
+        + ';border-radius:10px;font-size:' + (small ? '16px' : '15px') + ';line-height:1.6;resize:none;outline:none;font-family:inherit;box-sizing:border-box;width:auto;min-height:0"></textarea></div>';
+    ov.querySelector(".ipe-zoom-title").textContent = ipeZoomTitleFor(ta);
+    var count = ov.querySelector(".ipe-zoom-count");
+    var big = ov.querySelector(".ipe-zoom-ta");
+    big.value = ta.value;
+    big.readOnly = !!ta.readOnly; big.disabled = false;
+    function upd(){ count.textContent = big.value.length + " 字"; }
+    upd();
+    big.addEventListener("input", function(){
+        ta.value = big.value; upd();
+        try { ta.dispatchEvent(new Event("input", { bubbles: true })); } catch(e) {}
+    });
+    function done(){
+        try { ta.dispatchEvent(new Event("change", { bubbles: true })); } catch(e) {}
+        ipeZoomClose();
+    }
+    ov.querySelector(".ipe-zoom-close").addEventListener("click", done);
+    ov.addEventListener("click", function(ev){ if (ev.target === ov) done(); });
+    ov.__ipeKey = function(ev){ if (ev.key === "Escape") done(); };
+    d.addEventListener("keydown", ov.__ipeKey);
+    (d.body || d.documentElement).appendChild(ov);
+    /* iOS 上 top/bottom 拉伸偶尔不生效，遮罩塌成顶上一条灰。挂完实测一下，不够高就用像素硬撑。 */
+    try {
+        var rw2 = d.defaultView || ipeRootWindow() || window;
+        var vh = Number(rw2.innerHeight) || 0, vw = Number(rw2.innerWidth) || 0;
+        var rect = ov.getBoundingClientRect ? ov.getBoundingClientRect() : null;
+        if (vh > 0 && (!rect || rect.height < vh * 0.6)) { ov.style.height = vh + "px"; ov.style.minHeight = vh + "px"; }
+        if (vw > 0 && (!rect || rect.width < vw * 0.6)) { ov.style.width = vw + "px"; }
+        var bx = ov.firstElementChild;
+        if (bx) {
+            var br = bx.getBoundingClientRect ? bx.getBoundingClientRect() : null;
+            if (vh > 0 && (!br || br.height < vh * 0.5)) { bx.style.height = Math.max(200, vh - (small ? 0 : 24)) + "px"; bx.style.minHeight = "200px"; }
+        }
+    } catch(e) {}
+    setTimeout(function(){ try { big.focus(); big.setSelectionRange(big.value.length, big.value.length); } catch(e) {} }, 30);
+}
+/* 酒馆缓存旧 style.css 的自救：探针元素拿不到新样式，就找到本插件的 <link> 带版本号重载一次 */
+var ipeCssBusted = false;
+function ipeEnsureFreshCss() {
+    if (ipeCssBusted) return;
+    try {
+        var d = ipeRootDocument();
+        var probe = d.createElement("i");
+        probe.className = "ipe-zoom-btn";
+        probe.style.cssText = "";
+        (d.body || d.documentElement).appendChild(probe);
+        var pos = "";
+        try { pos = (d.defaultView || window).getComputedStyle(probe).position; } catch(e) {}
+        if (probe.parentNode) probe.parentNode.removeChild(probe);
+        if (pos === "absolute") return;                       // 新 CSS 在，不用管
+        var ver = "";
+        try { ver = String((typeof IPE_VERSION !== "undefined" && IPE_VERSION) || Date.now()); } catch(e) { ver = String(Date.now()); }
+        var links = d.querySelectorAll('link[rel="stylesheet"]');
+        for (var i = 0; i < links.length; i++) {
+            var href = String(links[i].getAttribute("href") || "");
+            if (/image-prompt-extractor[^"']*\/style\.css/i.test(href) || /\/ipe[^"']*\/style\.css/i.test(href)) {
+                links[i].setAttribute("href", href.split("?")[0] + "?v=" + encodeURIComponent(ver));
+                ipeCssBusted = true;
+                try { console.log("[IPE] style.css 疑似旧缓存，已带版本号重载"); } catch(e) {}
+            }
+        }
+    } catch(e) {}
+}
+
+function ipeInstallZoomButtons() {
+    ipeEnsureFreshCss();
+    ["#ipe-panel", "#ipe-drawer"].forEach(function(sel){
+        var root = q(sel); if (!root) return;
+        var list = root.querySelectorAll("textarea");
+        for (var i = 0; i < list.length; i++) (function(ta){
+            if (ta.__ipeZoom) return; ta.__ipeZoom = true;
+            var doc = ta.ownerDocument;
+            var wrap = doc.createElement("div"); wrap.className = "ipe-zoom-wrap";
+            wrap.style.cssText = "position:relative;width:100%";
+            ta.parentNode.insertBefore(wrap, ta); wrap.appendChild(ta);
+            var btn = doc.createElement("button");
+            btn.type = "button"; btn.className = "ipe-zoom-btn"; btn.title = "放大编辑"; btn.textContent = "⤢";
+            btn.style.cssText = "position:absolute;top:4px;right:6px;z-index:2;width:22px;height:22px;line-height:20px;padding:0;margin:0;"
+                + "border-radius:6px;border:1px solid rgba(128,128,128,.35);background:rgba(28,28,32,.55);color:#ccc;font-size:12px;cursor:pointer;opacity:.75";
+            btn.addEventListener("click", function(ev){ ev.preventDefault(); ev.stopPropagation(); ipeZoomOpen(ta); });
+            wrap.appendChild(btn);
+        })(list[i]);
+    });
 }
 
 function ipeSetStopButtonsState(active) {
@@ -4702,6 +5300,23 @@ function bindAll() {
 
     /* ---------- v2 新增控件绑定 ---------- */
     // 强制采用（缩水拦截后）
+    [["ipe-pack-export","ipe-pack-export-cur","ipe-pack-import","ipe-pack-file"],
+     ["iped-pack-export","iped-pack-export-cur","iped-pack-import","iped-pack-file"]].forEach(function(ids){
+        var bA = q("#" + ids[0]), bC = q("#" + ids[1]), bI = q("#" + ids[2]), fi = q("#" + ids[3]);
+        if (bA && !bA.dataset.ipeBound) { bA.dataset.ipeBound = "1"; bA.addEventListener("click", function(){ ipeImgPackExport("all"); }); }
+        if (bC && !bC.dataset.ipeBound) { bC.dataset.ipeBound = "1"; bC.addEventListener("click", function(){ ipeImgPackExport("current"); }); }
+        if (bI && fi && !bI.dataset.ipeBound) { bI.dataset.ipeBound = "1"; bI.addEventListener("click", function(){ try { fi.value = ""; fi.click(); } catch(e){} }); }
+        if (fi && !fi.dataset.ipeBound) {
+            fi.dataset.ipeBound = "1";
+            fi.addEventListener("change", function(){
+                var f = fi.files && fi.files[0]; if (!f) return;
+                var r = new FileReader();
+                r.onload  = function(){ ipeImgPackImportText(r.result); };
+                r.onerror = function(){ ipeToast("读文件失败", false); };
+                r.readAsText(f);
+            });
+        }
+    });
     [["ipe-ledger-export","ipe-ledger-import","ipe-ledger-file"],
      ["iped-ledger-export","iped-ledger-import","iped-ledger-file"]].forEach(function(ids){
         var bE = q("#" + ids[0]), bI = q("#" + ids[1]), fi = q("#" + ids[2]);
@@ -5072,6 +5687,7 @@ function bindAll() {
                 setTimeout(function(){
                     ipeLedgerSync();
                     ipeLedgerStatus("已切换到本聊天的账本", "#6ec577");
+                    try { ipeImgRefreshLayerUI(); } catch(eL) {}   // 四个层框换成本聊天的
                 }, 200);
             });
             console.log("[IPE] 已绑定换聊天事件");
@@ -5152,8 +5768,17 @@ function bindAll() {
     ipeRefreshTemplateEditors();
 }
 
-function buildInjectTag(desc) {
+function buildInjectTag(desc, layers) {
     var tpl = ipeGetTemplateValue() || cfg().baseTemplate || "image###{Description}###";
+    desc = String(desc == null ? "" : desc);
+    if (layers) {
+        var used = {}, any = false;
+        IPE_IMG_LAYERS.forEach(function(l){
+            var ph = IPE_IMG_LAYER_PH[l];
+            if (tpl.indexOf(ph) >= 0) { tpl = tpl.split(ph).join(String(layers[l] || "").trim()); used[l] = true; any = true; }
+        });
+        if (any) desc = ipeImgJoinLayers(layers, used);   // {Description} 只拿没被单独放置的层
+    }
     return tpl.indexOf("{Description}") >= 0 ? tpl.replace("{Description}", desc) : tpl + desc;
 }
 
@@ -5163,13 +5788,19 @@ function injectDescToMessage(desc, targetIdx) {
 
     var pv=q("#ipe-preview-text"), pvd=q("#iped-preview-text");
     if (!desc) desc = (pv&&pv.value)||(pvd&&pvd.value)||currentDesc;
+    var layers = null;
+    if (ipeImgLayeredOn() && ipeImgLayersFresh) {
+        var bx = ipeImgLayerBoxValues();
+        if (ipeImgJoinLayers(bx)) layers = bx;
+        if (!desc) desc = ipeImgJoinLayers(bx);
+    }
     if (!desc) throw new Error("没有内容");
 
     var c = ctx();
     var msg = c.chat[idx];
     if (!msg) throw new Error("消息不存在");
 
-    var tag = buildInjectTag(desc);
+    var tag = buildInjectTag(desc, layers);
     if (String(msg.mes || "").indexOf(tag) >= 0) {
         return { injected: false, reason: "duplicate", tag: tag };
     }
@@ -5255,32 +5886,49 @@ async function onExtract() {
     } catch(e){setStatus("错误: "+e.message,"#d4726a");}
 }
 
-async function runExtract(text, supplement, autoInjectNow, targetIdx, retryAttempt) {
+async function runExtract(text, supplement, autoInjectNow, targetIdx, retryAttempt, lockOverride) {
     retryAttempt = Number(retryAttempt || 0);
     if (retryAttempt === 0) ipeClearApiRetry();
 
     processing = true;
     var ball = q("#ipe-chat-quick-entry"); if(ball)ball.classList.add("processing");
-    setStatus(retryAttempt > 0 ? "正在自动重试提取…" : "正在提取…","#6ec577"); setBtns(false,false);
+    setStatus(retryAttempt > 0 ? "正在自动重试提取…" : (ipeImgLayeredOn() ? "正在分层提取…" : "正在提取…"),"#6ec577"); setBtns(false,false);
+    var layerNote = "";
     try {
-        var desc = await callAPI(text, supplement||"");
+        var desc = await callAPI(text, supplement||"", lockOverride);
+        if (ipeImgLayeredOn()) {
+            var parsed = ipeImgParseLayers(desc);
+            if (parsed.found > 0) {
+                var floorNo = (typeof targetIdx === "number" ? targetIdx : currentIdx) + 1;
+                var locks = ipeImgLocks(lockOverride);
+                var merged = ipeImgMergeLayers(parsed, ipeImgPrevLayers(locks), locks, floorNo);
+                ipeImgSetLayerBoxes(merged);
+                ipeImgLayersSave(merged, floorNo);
+                desc = ipeImgJoinLayers(merged);
+                ipeImgLayersFresh = true;
+                layerNote = merged.notes.length ? "（" + merged.notes.join("，") + "）" : "（五层齐全）";
+            } else {
+                ipeImgLayersFresh = false;
+                layerNote = "（副 AI 没分层，按整段收下；层框未更新）";
+            }
+        }
         currentDesc = desc; setPreview(desc);
 
         if (autoInjectNow) {
             var result = injectDescToMessage(desc, typeof targetIdx === "number" ? targetIdx : currentIdx);
             if (result && result.injected) {
-                setStatus("提取完成并已自动注入 ✓","#6ec577");
+                setStatus("提取完成并已自动注入 ✓" + layerNote,"#6ec577");
                 setBtns(false,false);
                 var s1=q("#ipe-supplement"),s2=q("#iped-supplement");
                 if(s1)s1.value=""; if(s2)s2.value="";
                 if(ball) ball.classList.remove("has-result");
             } else {
-                setStatus("提取完成，跳过自动注入（可能已注入）","#6ec577");
+                setStatus("提取完成，跳过自动注入（可能已注入）" + layerNote,"#6ec577");
                 setBtns(true,true);
                 if(ball) ball.classList.add("has-result");
             }
         } else {
-            setStatus("提取完成 — 可编辑后确认注入","#6ec577");
+            setStatus("提取完成 — 可编辑后确认注入" + layerNote,"#6ec577");
             setBtns(true,true);
             if(ball) ball.classList.add("has-result");
         }
@@ -5295,7 +5943,7 @@ async function runExtract(text, supplement, autoInjectNow, targetIdx, retryAttem
         setBtns(true,false); if(ball)ball.classList.remove("processing");
 
         if (ipeShouldRetryApiError(e, userAbort)) {
-            ipeScheduleApiRetry(text, supplement || "", !!autoInjectNow, targetIdx, retryAttempt, msg);
+            ipeScheduleApiRetry(text, supplement || "", !!autoInjectNow, targetIdx, retryAttempt, msg, lockOverride);
         }
     }
     ipeAbortController = null;
@@ -5309,6 +5957,23 @@ async function onReroll() {
     try{var msg=ctx().chat[currentIdx];if(!msg)return;
     var sup=q("#ipe-supplement");var supd=q("#iped-supplement");
     await runExtract(msg.mes,(sup&&sup.value)||(supd&&supd.value)||"", false, currentIdx);}catch(e){}
+}
+
+async function onRerollLayer(layer) {
+    if (processing) return;
+    if (!ipeImgLayeredOn()) { setStatus("先打开「分层提取」", "#c9a227"); return; }
+    if (currentIdx < 0) {
+        // 还没提取过：默认盯最后一条 AI 楼
+        try { var ch = ctx().chat || []; for (var i = ch.length - 1; i >= 0; i--) { if (ch[i] && !ch[i].is_user) { currentIdx = i; break; } } } catch(e) {}
+        if (currentIdx < 0) { setStatus("没找到可读的正文", "#d4726a"); return; }
+    }
+    try {
+        var msg = ctx().chat[currentIdx]; if (!msg) return;
+        var ov = {}; IPE_IMG_LAYERS.forEach(function(x){ ov[x] = x !== layer; });   // 其余三层临时锁定
+        var sup = q("#ipe-supplement"), supd = q("#iped-supplement");
+        setStatus("只重摇" + IPE_IMG_LAYER_LABEL[layer] + "层，其余各层锁定…", "#6ec577");
+        await runExtract(msg.mes, (sup && sup.value) || (supd && supd.value) || "", false, currentIdx, 0, ov);
+    } catch(e) {}
 }
 
 function onInject() {

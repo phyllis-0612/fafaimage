@@ -60,7 +60,10 @@ function boot(floors) {
         "ipeFloorNo", "ipeLedgerApplyEP", "ipeLedgerNormalize", "ipeLedgerStop",
         "ipeLedgerIsAbort", "ipeLedgerExport", "ipeLedgerImportText", "ipeLedgerInspectEP",
         "EXT_NAME", "DEFAULTS", "IPE_LEDGER_EP_KEY", "init", "ipeLedgerStripImageTag", "ipeLedgerBuildUser", "ipeLedgerReportBlock", "ipeLedgerPruneMirror",
-        "ipeLedgerRun", "ipeLedgerCallAPI", "ipeLedgerReadStream", "ipeLedgerIsReasoningModel"];
+        "ipeLedgerRun", "ipeLedgerCallAPI", "ipeLedgerReadStream", "ipeLedgerIsReasoningModel",
+        "runExtract", "ipeImgParseLayers", "buildInjectTag", "buildVisionUserPrompt", "ipeImgLayersRead", "onRerollLayer",
+        "ipeInstallZoomButtons", "ipeZoomOpen", "ipeZoomClose", "ipeZoomTitleFor",
+        "ipeImgPackBuild", "ipeImgPackImportText", "ipeGetBaseTemplates", "ipeGetRulePresets", "ipeGetSystemPromptPresets", "ipeGetAnchorPresets", "ipeGetAnchorUsageGuide"];
     const shim = SRC + "\n;(function(){ " +
         exposed.map(n => `try{ window.__t_${n} = ${n}; }catch(e){}`).join(" ") +
         " try{ window.__t_failStreak = function(){ return ipeLedgerFailStreak; }; }catch(e){}" +
@@ -415,6 +418,242 @@ await (async () => {
     } }; } } });
     await F("ipeLedgerRun")(9, true);
     ok(F("ipeLedgerRead")().current.indexOf("放宽后") >= 0, "首字节后 1.5 秒沉默没被判死", statusText(w));
+})();
+
+/* ---- 分层生图用的假 API：整包 JSON，顺手把请求体抓出来 ---- */
+function imgApi(w, tavern, F, content, capture) {
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    st.apiEndpoint = "http://x.test/v1"; st.apiKey = "k"; st.model = "gpt-4.1";
+    st.apiProfilesJson = JSON.stringify([{ id: "api_1", name: "t", endpoint: "http://x.test/v1", key: "k", model: "gpt-4.1" }]);
+    w.fetch = async (u, o) => { if (capture) capture.body = JSON.parse(o.body); return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: typeof content === "function" ? content() : content } }] }) }; };
+    return st;
+}
+const L4 = (cam, env, chars, pose, mood) => `<camera>${cam}</camera>\n<env>${env}</env>\n` + (mood != null ? `<mood>${mood}</mood>\n` : "") + `<chars>${chars}</chars>\n<pose>${pose}</pose>`;
+const box = (w, id) => { const el = w.document.querySelector("#" + id); return el ? el.value : null; };
+const imgStatus = w => { const el = w.document.querySelector("#ipe-status"); return el ? el.textContent : ""; };
+
+console.log("\n【22】 分层剥壳：完整 / 漏闭标签 / 围栏 / 没分层");
+{
+    const { F } = boot(4);
+    const P = F("ipeImgParseLayers");
+    const a = P(L4("medium shot", "rainy rooftop at dusk", "a girl in white", "she leans on the railing"));
+    eq(a.found, 4, "四层齐全"); eq(a.env, "rainy rooftop at dusk", "环境层内容对");
+    const b = P("<camera>close-up\n<env>dim classroom</env><chars>boy</chars><pose>sits");
+    eq(b.found, 4, "漏闭标签也认"); eq(b.camera, "close-up", "漏闭标签取到下一个开标签为止"); eq(b.pose, "sits", "末尾漏闭标签取到结尾");
+    const c = P("```\n<Camera>wide</Camera><ENV>street</ENV>\n```");
+    eq(c.found, 2, "围栏剥掉、大小写不敏感"); eq(c.env, "street", "ENV 大写也认");
+    eq(P("just a plain description").found, 0, "没标签 → found 0");
+}
+
+console.log("\n【23】 分层提取端到端：四框落值、整段拼好、环境层次楼 NO_CHANGE 沿用");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => L4("medium two-shot at eye level.", "A rain-soaked rooftop at dusk, sodium lights below.", "A girl in a white dress, hair wet.", "She grips the railing, facing the city."), cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("<camera>") >= 0, "请求里带分层合同");
+    ok(cap.body.messages[1].content.indexOf("上一楼的环境层") < 0, "第一次没有上一楼环境可继承");
+    eq(box(w, "ipe-layer-env"), "A rain-soaked rooftop at dusk, sodium lights below.", "环境框落值");
+    eq(box(w, "ipe-layer-pose"), "She grips the railing, facing the city.", "动作框落值");
+    ok(String(box(w, "ipe-preview-text")).indexOf("medium two-shot at eye level. A rain-soaked rooftop") === 0, "整段按 镜头→环境→人物→动作 拼好", box(w, "ipe-preview-text"));
+    const saved = F("ipeImgLayersRead")();
+    eq(saved.floor, 10, "存档记了楼号 10"); eq(saved.env, "A rain-soaked rooftop at dusk, sodium lights below.", "存档有环境层");
+    // 次楼：环境没换
+    imgApi(w, tavern, F, () => L4("close-up.", "NO_CHANGE", "The girl, eyes closed.", "She turns her face into the rain."), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("上一楼的环境层") >= 0 && cap.body.messages[1].content.indexOf("sodium lights") >= 0, "第二次把上一楼环境喂给了副 AI");
+    eq(box(w, "ipe-layer-env"), "A rain-soaked rooftop at dusk, sodium lights below.", "NO_CHANGE → 环境沿用");
+    eq(box(w, "ipe-layer-camera"), "close-up.", "其他层照常更新");
+    ok(imgStatus(w).indexOf("环境沿用第 10 楼") >= 0, "状态行说明环境沿用自哪一楼", imgStatus(w));
+    ok(imgStatus(w).indexOf("氛围层为空") >= 0, "没给氛围层时状态行点名（提醒该改提取提示词）", imgStatus(w));
+    ok(String(box(w, "ipe-preview-text")).indexOf("NO_CHANGE") < 0, "整段里不会出现 NO_CHANGE");
+})();
+
+console.log("\n【24】 锁：锁住动作层后副 AI 给的新动作被忽略，且锁定内容喂回请求");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => L4("wide.", "a quiet library.", "a boy in uniform.", "he reads at the desk."), cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    st.imgLockPose = true;
+    w.document.querySelector("#ipe-layer-pose").value = "he reads at the desk, left hand on the page.";   // 人改过再锁 = 照这个来
+    imgApi(w, tavern, F, () => L4("wide.", "a quiet library.", "a boy in uniform.", "he stands up and leaves."), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("已锁定的层") >= 0 && cap.body.messages[1].content.indexOf("left hand on the page") >= 0, "锁定层原文进了请求");
+    eq(box(w, "ipe-layer-pose"), "he reads at the desk, left hand on the page.", "锁住的动作层没被覆盖");
+    ok(String(box(w, "ipe-preview-text")).indexOf("stands up") < 0, "整段里也没有副 AI 的新动作");
+})();
+
+console.log("\n【25】 只重摇一层：其余三层临时锁定");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => L4("A.", "B.", "C.", "D."), cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    imgApi(w, tavern, F, () => L4("A2.", "B2.", "C2.", "D2."), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9, 0, { camera: true, env: true, chars: true, pose: false });
+    eq(box(w, "ipe-layer-camera"), "A.", "镜头层保持"); eq(box(w, "ipe-layer-env"), "B.", "环境层保持"); eq(box(w, "ipe-layer-chars"), "C.", "人物层保持");
+    eq(box(w, "ipe-layer-pose"), "D2.", "只有动作层换了新的");
+    eq(box(w, "ipe-preview-text"), "A. B. C. D2.", "整段随之重拼");
+    const c = cap.body.messages[1].content;
+    ok(c.indexOf("<camera>A.</camera>") >= 0 && c.indexOf("<pose>") >= 0 && c.indexOf("<pose>D.</pose>") < 0, "请求里锁了三层，没锁动作层");
+})();
+
+console.log("\n【26】 模板占位符：{Env} {Pose} 单放，{Description} 拿剩下的；老模板照旧");
+{
+    const { tavern, F } = boot(4);
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    const layers = { camera: "CAM", env: "ENV", chars: "CHR", pose: "POS" };
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "分层", value: "scene: {Env} | action: {Pose} | rest: {Description}" }]);
+    st.activeBaseTemplate = "tpl_1";
+    eq(F("buildInjectTag")("ignored", layers), "scene: ENV | action: POS | rest: CAM CHR", "层占位符各就各位，{Description} 只拿没放的层");
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "老", value: "image###{Description}###" }]);
+    eq(F("buildInjectTag")("CAM ENV CHR POS", layers), "image###CAM ENV CHR POS###", "老模板：整段进 {Description}");
+    eq(F("buildInjectTag")("plain", null), "image###plain###", "非分层模式完全不受影响");
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "全层", value: "{Camera}/{Env}/{Chars}/{Pose}" }]);
+    eq(F("buildInjectTag")("whatever", layers), "CAM/ENV/CHR/POS", "四层全单放、没有 {Description} 也不多拼");
+}
+
+console.log("\n【27】 副 AI 没分层：整段兜底，层框不动，状态行明示；分层关着时合同不发");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => "just one flat english description.", cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    eq(box(w, "ipe-preview-text"), "just one flat english description.", "整段照收");
+    ok(imgStatus(w).indexOf("没分层") >= 0, "状态行说明副 AI 没分层", imgStatus(w));
+    eq(box(w, "ipe-layer-env"), "", "层框没被乱填");
+    st.imgLayered = false;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("<camera>") < 0 && cap.body.messages[1].content.indexOf("只输出最终英文 Description") >= 0, "分层关着：老合同原样");
+})();
+
+console.log("\n【28】 氛围层：独立第五层，拼装在环境之后、人物之前；NO_CHANGE 沿用并报楼号；{Mood} 占位符");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => L4("wide shot.", "an empty classroom.", "a boy.", "he sits alone.", "cold fluorescent light, low contrast."), cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    eq(box(w, "ipe-layer-mood"), "cold fluorescent light, low contrast.", "氛围框落值");
+    eq(box(w, "ipe-preview-text"), "wide shot. an empty classroom. cold fluorescent light, low contrast. a boy. he sits alone.", "顺序：镜头 环境 氛围 人物 动作");
+    ok(imgStatus(w).indexOf("五层齐全") >= 0, "五层齐全", imgStatus(w));
+    imgApi(w, tavern, F, () => L4("close-up.", "NO_CHANGE", "the boy, eyes shut.", "he presses his palms to his eyes.", "NO_CHANGE"), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("上一楼的氛围层") >= 0, "上一楼氛围喂给了副 AI");
+    eq(box(w, "ipe-layer-mood"), "cold fluorescent light, low contrast.", "氛围 NO_CHANGE → 沿用");
+    ok(imgStatus(w).indexOf("氛围沿用第 10 楼") >= 0 && imgStatus(w).indexOf("环境沿用第 10 楼") >= 0, "状态行分别报环境与氛围沿用楼号", imgStatus(w));
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "五层", value: "M={Mood};rest={Description}" }]);
+    st.activeBaseTemplate = "tpl_1";
+    eq(F("buildInjectTag")("x", { camera: "C", env: "E", mood: "MO", chars: "CH", pose: "P" }), "M=MO;rest=C E CH P", "{Mood} 单放，其余进 {Description}");
+})();
+
+console.log("\n【29】 ⤢ 放大编辑：每个文本框都有按钮，弹窗里打字实时回填并触发原有 input 链，完成后关闭");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    F("ipeInstallZoomButtons")();
+    const d = w.document;
+    const src = d.querySelector("#ipe-layer-pose");
+    ok(src && src.parentNode.classList.contains("ipe-zoom-wrap") && src.parentNode.querySelector(".ipe-zoom-btn"), "动作层框被包了一层并带 ⤢ 按钮");
+    ok(d.querySelector("#ipe-ledger-prompt").parentNode.querySelector(".ipe-zoom-btn"), "挂账规则框也有按钮");
+    // 抽屉要 jQuery + #extensions_settings2，假酒馆没有；用一个假的 iped 框验证 id 映射
+    const fake = d.createElement("textarea"); fake.id = "iped-ledger-note"; d.body.appendChild(fake);
+    F("ipeInstallZoomButtons")();
+    eq(src.parentNode.querySelectorAll(".ipe-zoom-btn").length, 1, "重复安装不重复加按钮");
+    eq(F("ipeZoomTitleFor")(src), "🤝 动作层", "标题按 id 映射");
+    eq(F("ipeZoomTitleFor")(fake), "本卡要点 / 世界观硬设定", "抽屉 iped- 前缀的 id 也能映射");
+    // 先让层框 UI 绑上（init 里是 120ms 定时器）
+    await new Promise(r => setTimeout(r, 200));
+    tavern.extensionSettings[F("EXT_NAME")].imgLayered = true;
+    F("ipeZoomOpen")(src);
+    const ov = d.getElementById("ipe-zoom-overlay");
+    ok(!!ov, "弹窗出现了");
+    eq(ov.style.position, "fixed", "弹窗定位内联，不依赖外部 CSS");
+    ok(ov.style.zIndex === "2147483647" && ov.style.getPropertyPriority("z-index") === "important" && ov.style.display === "flex", "z-index 最大值且 important，压得住被强制到 2147483646 的面板");
+    ok(/px$/.test(ov.style.height) && parseInt(ov.style.height, 10) === w.innerHeight, "jsdom 里 rect 为 0 → 触发像素兜底，高度=视口高");
+    ok(d.querySelector("#ipe-panel .ipe-footer").textContent.indexOf("v2.12.0") >= 0, "面板底栏带版本号");
+    eq(src.parentNode.querySelector(".ipe-zoom-btn").style.position, "absolute", "按钮定位内联");
+    const big = ov.querySelector(".ipe-zoom-ta");
+    big.value = "he leans on the door frame.";
+    big.dispatchEvent(new w.Event("input", { bubbles: true }));
+    eq(src.value, "he leans on the door frame.", "源框实时回填");
+    eq(d.querySelector("#ipe-preview-text").value, "he leans on the door frame.", "原有 input 链触发：整段预览随之重拼");
+    eq(ov.querySelector(".ipe-zoom-count").textContent, "27 字", "字数计数");
+    ov.querySelector(".ipe-zoom-close").click();
+    ok(!d.getElementById("ipe-zoom-overlay"), "点完成关闭");
+    F("ipeZoomOpen")(src);
+    d.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape" }));
+    ok(!d.getElementById("ipe-zoom-overlay"), "Esc 关闭");
+})();
+
+console.log("\n【30】 生图预设包：导出不带密钥，「只导出当前」只带选中的");
+{
+    const { tavern, F } = boot(4);
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    st.apiProfilesJson = JSON.stringify([{ id: "api_1", name: "秘密", endpoint: "http://x", key: "sk-SECRET", model: "m" }]);
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "校园明媚", value: "A{Description}" }, { id: "tpl_2", name: "暗色油画", value: "B{Description}" }]);
+    st.activeBaseTemplate = "tpl_2";
+    st.rulePresetsJson = JSON.stringify([{ id: "rule_1", name: "GPT-image-2", value: "R1" }, { id: "rule_2", name: "NAI", value: "R2" }]);
+    st.activeRulePreset = "rule_1";
+    st.anchorPresetsJson = JSON.stringify([{ id: "anchor_1", name: "苑无忧", value: "boy" }]);
+    st.anchorUsageGuide = "我改过的规则";
+    const all = F("ipeImgPackBuild")("all");
+    eq(all._fmt, "ipe-image-pack", "格式标记");
+    eq(all.templates.length, 2, "全部：两套模板都在");
+    eq(all.rules.length, 2, "全部：两条规则都在");
+    eq(all.anchorGuide, "我改过的规则", "带用户改过的通用锚点规则");
+    ok(JSON.stringify(all).indexOf("sk-SECRET") < 0 && JSON.stringify(all).indexOf("http://x") < 0, "不含 API 地址与密钥");
+    const cur = F("ipeImgPackBuild")("current");
+    eq(cur.templates.length, 1, "当前：只有一套模板"); eq(cur.templates[0].name, "暗色油画", "是选中的那套");
+    eq(cur.rules.length, 1, "当前：只有一条规则"); eq(cur.rules[0].name, "GPT-image-2", "是选中的那条");
+    eq(cur.systemPrompts.length, 1, "当前：系统提示只带选中的一槽");
+}
+
+console.log("\n【31】 导入：按名字合并，新名字追加、同名覆盖、别人的原有预设一个不少；系统提示按 id 对槽；裸数组当模板");
+await (async () => {
+    const { w, tavern, F } = boot(4);
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    w.confirm = () => true;
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "校园明媚", value: "OLD" }, { id: "tpl_9", name: "我自己的", value: "MINE" }]);
+    st.rulePresetsJson = JSON.stringify([{ id: "rule_1", name: "GPT-image-2", value: "R-old" }]);
+    st.anchorPresetsJson = JSON.stringify([{ id: "anchor_1", name: "角色锚点1", value: "" }]);
+    const pack = {
+        _fmt: "ipe-image-pack", _v: 1,
+        templates: [{ name: "校园明媚", value: "NEW" }, { name: "暗色油画", value: "DARK" }],
+        rules: [{ name: "GPT-image-2", value: "R-old" }, { name: "NanoBanana", value: "R-nb" }],
+        systemPrompts: [{ id: "sys_plot", name: "剧情", value: "PLOT-NEW" }, { id: "sys_x", name: "不存在的槽", value: "X" }],
+        anchors: [{ name: "苑无忧", value: "boy anchors" }],
+        anchorGuide: "对方的规则"
+    };
+    const sum = F("ipeImgPackImportText")(JSON.stringify(pack));
+    ok(!!sum, "导入成功");
+    const tpl = F("ipeGetBaseTemplates")();
+    eq(tpl.length, 3, "模板：原 2 + 新 1 = 3（同名覆盖不新增）");
+    eq(tpl.find(x => x.name === "校园明媚").value, "NEW", "同名模板被覆盖");
+    eq(tpl.find(x => x.name === "我自己的").value, "MINE", "对方自己的模板原样保留");
+    ok(tpl.find(x => x.name === "暗色油画"), "新模板追加");
+    eq(sum.templates.added, 1, "统计：模板 +1"); eq(sum.templates.replaced, 1, "统计：模板覆盖 1");
+    eq(sum.rules.replaced, 0, "内容相同的同名规则不算覆盖"); eq(sum.rules.added, 1, "规则 +1");
+    const sys = F("ipeGetSystemPromptPresets")();
+    eq(sys.find(x => x.id === "sys_plot").value, "PLOT-NEW", "系统提示按 id 对槽覆盖");
+    eq(sys.length, 2, "系统提示仍是两槽，对不上号的不硬塞");
+    ok(F("ipeGetAnchorPresets")().find(x => x.name === "苑无忧"), "锚点追加");
+    eq(F("ipeGetAnchorUsageGuide")(), "对方的规则", "通用锚点规则替换");
+    // 取消 = 什么都不动
+    w.confirm = () => false;
+    const before = JSON.stringify(F("ipeGetBaseTemplates")());
+    const r2 = F("ipeImgPackImportText")(JSON.stringify({ _fmt: "ipe-image-pack", templates: [{ name: "校园明媚", value: "NEWER" }] }));
+    ok(r2 === null && JSON.stringify(F("ipeGetBaseTemplates")()) === before, "confirm 取消 → 原样不动");
+    // 裸数组 = 模板表
+    w.confirm = () => true;
+    const r3 = F("ipeImgPackImportText")(JSON.stringify([{ name: "只发模板", value: "T" }]));
+    eq(r3.templates.added, 1, "裸数组按模板导入");
+    ok(F("ipeImgPackImportText")("not json") === null, "坏 JSON 拒收");
+    ok(F("ipeImgPackImportText")(JSON.stringify({ _fmt: "ipe-ledger", data: {} })) === null, "账本包拒收，不会串门");
 })();
 
 console.log("\n" + "\u2500".repeat(46));
