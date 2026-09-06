@@ -4,7 +4,7 @@
  */
 
 const EXT_NAME = "image-prompt-extractor";
-var IPE_VERSION = "2.12.0";
+var IPE_VERSION = "2.12.11";
 const DEFAULTS = {
     enabled: true,
     mistTheme: false,   // v1.8.7 开灯：莫兰迪雾蓝浅色皮，默认关（暗色）
@@ -45,6 +45,7 @@ const DEFAULTS = {
     ledgerPromptPresetsJson: "", activeLedgerPrompt: "lp_1",
     ledgerNotePresetsJson: "",   activeLedgerNote: "ln_1",
     ledgerAutoRun: false,
+    ledgerAutoOffReason: "",       // 2.12.4 自动挂账被插件自己关掉的原因：fail（连续失败）/ shrink（疑似事故）；人手动开回去就清空
     ledgerStream: true,            // 2.10.0 流式接收：思考模型边想边流，中转不会因空闲把连接掐断
     ledgerIdleTimeout: 300,        // 秒。「连续多少秒一个字节都没收到」才判死；0 = 永不
     ledgerReasoningEffort: "",     // reasoning_effort；空 = 不发，用模型默认
@@ -58,7 +59,7 @@ let ipeUserAbortRequested = false;
 let ipeRetryTimer = null;
 let autoTimer = null, pendingAutoIdx = -1;
 
-const IPE_CREDITS = "ripple & GPT & Claude";
+const IPE_CREDITS = "ripple & GPT & Claude Fable 5.1";
 const IPE_DEFAULT_ANCHOR_USAGE_GUIDE = [
     "以下角色锚点仅为候选资料库，不是强制全部使用。提取时请严格根据正文当前场景按需调用：",
     "1. 只调用正文中明确出场、且当前画面确实需要入镜的角色。",
@@ -1223,14 +1224,41 @@ function ipeLedgerIsAbort(e) {
     return !!e && (e.name === "AbortError" || /abort/i.test(String((e && e.message) || "")));
 }
 
+/* 插件自己把自动挂账关掉：记下原因、面板里留提示、弹一张带「重新打开」按钮的常驻卡。
+   以前只在状态行说一句，人根本发现不了，之后几十楼都没记账。 */
+function ipeLedgerAutoOff(reason) {
+    save("ledgerAutoRun", false);
+    save("ledgerAutoOffReason", String(reason || "fail"));
+    try { ipeLedgerRefreshBotEditors(); } catch(e) {}
+    var why = reason === "shrink"
+        ? "上一轮副 AI 交回来的账本比旧版短太多，像是事故，已经拦下没落账。"
+        : "已经连续两次挂账失败，多半是 API 或模型的问题，再撞下去只会烧额度。";
+    try {
+        ipeNotice({
+            kind: "error", sticky: true,
+            title: "自动挂账已被插件关闭",
+            body: why + "\n\n之后每一楼都不会自动记账。处理好后点下面按钮重开。",
+            actions: [{ label: "重新打开自动挂账", onClick: function(){
+                save("ledgerAutoRun", true); save("ledgerAutoOffReason", "");
+                ipeLedgerFailStreak = 0;
+                try { ipeLedgerRefreshBotEditors(); } catch(e) {}
+                ipeLedgerStatus("自动挂账已重新打开（每来一楼跑一次）", "#6ec577");
+            } }]
+        });
+    } catch(e) {}
+}
+
 /* 状态行在面板里，面板关着就等于没说。失败必须弹到面板外面来。 */
 function ipeLedgerFailNotice(detail) {
-    var body = "挂账失败：" + detail;
+    var d0 = String(detail || "");
+    if (d0.length > 160) d0 = d0.slice(0, 160) + "…（完整错误见挂账页状态行）";
+    var body = "挂账失败：" + d0;
     if (ipeLedgerFailStreak >= 2) {
         body += "\n已经连续失败 " + ipeLedgerFailStreak + " 次——多半不是这一楼的问题，"
              +  "换一套 API 预设或换个模型再试。";
     }
-    try { ipeShowApiFailurePopup(body, false); } catch(e) {}
+    body += "\n\n这一楼没挂上，贴耳还是上一份。先别发下一条，去点「重新挂账」补上。";
+    try { ipeShowApiFailurePopup(body, false, { sticky: true, title: "挂账失败 · 账本还是上一份" }); } catch(e) {}
 }
 var ipeLedgerStaleWarned = false;
 
@@ -1320,7 +1348,7 @@ async function ipeLedgerRun(targetIdx, silent) {
             ipeLedgerShowForce(true);
             // 事故现场就该停车等人来看，不能带着警报继续飞
             var wasAuto = cfg().ledgerAutoRun === true;
-            if (wasAuto) { save("ledgerAutoRun", false); ipeLedgerRefreshBotEditors(); }
+            if (wasAuto) { ipeLedgerAutoOff("shrink"); }
             ipeLedgerStatus("疑似事故已拦截：新账本只有旧版的 "
                 + Math.round(body.length / oldText.length * 100) + "%，账本未改动。"
                 + (wasAuto ? "自动挂账已自动关闭，等你看过再开。" : "")
@@ -1344,8 +1372,7 @@ async function ipeLedgerRun(targetIdx, silent) {
            跟缩水拦截一个道理：事故现场停车，等人来看。 */
         var offNote = "";
         if (ipeLedgerFailStreak >= 2 && cfg().ledgerAutoRun === true) {
-            save("ledgerAutoRun", false);
-            try { ipeLedgerRefreshBotEditors(); } catch(e2) {}
+            ipeLedgerAutoOff("fail");
             offNote = "自动挂账已自动关闭，换好 API 再开。";
         }
         ipeLedgerStatus("挂账失败：" + d + (offNote ? "｜" + offNote : ""), "#d4726a");
@@ -2089,7 +2116,24 @@ function ipeLedgerRefreshBotEditors() {
         el.value = String(Number(cfg().ledgerVersionsN) || 3);
     });
     ["ipe-ledger-auto","iped-ledger-auto"].forEach(function(id){
-        var el = q("#" + id); if (el) el.checked = cfg().ledgerAutoRun === true;
+        var el = q("#" + id); if (!el) return;
+        el.checked = cfg().ledgerAutoRun === true;
+        // 开关在左：老 style.css 里那条 space-between !important 会把它推回右边，这里用 important 压回来
+        try { if (el.parentNode && el.parentNode.tagName === "LABEL") el.parentNode.style.setProperty("justify-content", "flex-start", "important"); } catch(e) {}
+    });
+    ["ipe-ledger-auto-hint","iped-ledger-auto-hint"].forEach(function(id){
+        var el = q("#" + id); if (!el) return;
+        var reason = String(cfg().ledgerAutoOffReason || "");
+        var off = cfg().ledgerAutoRun !== true;
+        if (off && reason) {
+            el.style.display = "";
+            el.style.color = "#c9a227";
+            el.textContent = "⚠ 自动挂账不是你关的，是插件自己关的：" + (reason === "shrink" ? "上一轮账本疑似事故被拦下" : "连续两次挂账失败")
+                + "。这期间每一楼都不会自动记账。确认 API 正常后，点左边开关重开。";
+        } else {
+            el.style.display = "none";
+            el.textContent = "";
+        }
     });
     ["ipe-ledger-nochange","iped-ledger-nochange"].forEach(function(id){
         var el = q("#" + id); if (el) el.checked = cfg().ledgerAllowNoChange === true;
@@ -3603,64 +3647,251 @@ function ipeShouldRetryApiError(e, userAbort) {
     return true;
 }
 
-function ipeShowApiFailurePopup(msg, willRetry) {
-    var title = "IPE：API 请求失败";
-    var body = msg || "API 暂时不可用。";
-    if (willRetry) body += "\n10 秒后自动重试一次。";
-
+/* ============================================================
+   🐚 通知卡（2.12.2）
+   toastr 那块红是酒馆的默认皮，跟小海螺一点不搭。报错也要好看：
+   开灯是雾蓝米霜、关灯是深色玻璃，错误只用一条莫兰迪砖红细边，不整块糊红。
+   sticky 的带「知道了」按钮常驻；不 sticky 的底下一条细线走完自己收起，
+   鼠标放上去暂停。最多叠 4 张，老的非常驻先走。关键样式全内联，不吃 CSS 缓存的亏。
+   ============================================================ */
+/* 卡片上的动作按钮（如「重新打开自动挂账」）：点了先干活再关卡 */
+function ipeNoticeActionsHTML(opts, accent, pad, fs) {
+    var acts = (opts && Array.isArray(opts.actions)) ? opts.actions : [];
+    var h = "";
+    for (var i = 0; i < acts.length; i++) {
+        var a = acts[i]; if (!a || !a.label) continue;
+        h += '<button type="button" class="ipe-notice-act" data-ipe-act="' + i + '" style="padding:' + pad + ';border-radius:9px;border:1px solid ' + accent + ';background:' + accent + ';color:#fff;font-size:' + fs + ';cursor:pointer;font-family:inherit;font-weight:600">' + String(a.label).replace(/[<>&]/g, "") + '</button>';
+    }
+    return h;
+}
+function ipeNoticeBindActions(root, opts, closeFn) {
     try {
-        var w = ipeRootWindow();
-        var toastr = w && (w.toastr || (w.parent && w.parent.toastr));
-        if (toastr && typeof toastr.error === "function") {
-            toastr.error(body, title, { timeOut: 9000, extendedTimeOut: 3000, closeButton: true, progressBar: true });
-            return;
+        var acts = (opts && Array.isArray(opts.actions)) ? opts.actions : [];
+        var btns = root.querySelectorAll(".ipe-notice-act");
+        for (var i = 0; i < btns.length; i++) (function(b){
+            var a = acts[Number(b.getAttribute("data-ipe-act"))];
+            b.addEventListener("click", function(){ try { if (a && typeof a.onClick === "function") a.onClick(); } catch(e) {} closeFn(); });
+        })(btns[i]);
+    } catch(e) {}
+}
+
+/* 浮层挂哪儿：挂 <html>，不挂 body。
+   实测（2.12.5 自检）：某些酒馆环境里 body 被加了 transform / filter，fixed 元素就不再以屏幕为参照，
+   而是以 body 的盒子为参照，body 高度又是 0，于是 bottom:88px 算出来在屏幕上方 -88px。
+   放大编辑框第一次塌成顶上一条灰也是它。<html> 没人动，挂那儿 fixed 才是真 fixed。 */
+function ipeOverlayHost(d) {
+    d = d || ipeRootDocument();
+    return d.documentElement || d.body;
+}
+/* 保险：挂完量一下，真飞出屏幕就用 visualViewport 算像素 top 硬摆回来 */
+function ipeNoticeFixPosition(st) {
+    try {
+        if (!st || !st.getBoundingClientRect) return;
+        var rw = ipeRootWindow() || window;
+        var vv = rw.visualViewport;
+        var vh = (vv && vv.height) || rw.innerHeight || 0;
+        var vtop = (vv && vv.offsetTop) || 0;
+        if (!vh) return;
+        var rc = st.getBoundingClientRect();
+        var off = rc.height > 0 && (rc.top < vtop || rc.top > vtop + vh - 60);
+        if (!off && !st.__ipePinned) return;
+        var top = vtop + 14;
+        st.style.setProperty("bottom", "auto", "important");
+        st.style.setProperty("top", Math.round(top) + "px", "important");
+        st.__ipePinned = true;
+    } catch(e) {}
+}
+
+function ipeNoticeStack() {
+    var d = ipeRootDocument();
+    var st = d.getElementById("ipe-notice-stack");
+    if (st) return st;
+    st = d.createElement("div"); st.id = "ipe-notice-stack";
+    /* 贴顶不贴底（照小红霞的做法）：body 被加 transform 时 fixed 以 body 盒子为参照、body 高 0，
+       bottom:88px 会算到屏幕上方；top:22px 不管参照是谁都落在屏幕顶部 22px。 */
+    /* 水平居中（群友要求）：left:50% + translateX(-50%)，跟系统通知一个位置，也不挡右上角 */
+    st.style.cssText = "position:fixed;left:50%;right:auto;top:22px;bottom:auto;width:min(280px,calc(100vw - 28px));display:flex;flex-direction:column;gap:6px;pointer-events:none;margin:0;padding:0";
+    /* 面板被强制 translateZ(0) 走了独立合成层；WebKit 上非合成层的浮层有时会被合成层盖住、不认 z-index。
+       通知栈同样开合成层，跟面板站到同一条起跑线上。 */
+    try { st.style.setProperty("z-index", "2147483647", "important"); } catch(e) {}
+    try { st.style.setProperty("transform", "translateX(-50%) translateZ(0)", "important"); st.style.setProperty("will-change", "transform", "important"); st.style.setProperty("visibility", "visible", "important"); st.style.setProperty("display", "flex", "important"); } catch(e) {}
+    try { var rw = ipeRootWindow(); if (rw && rw.innerWidth && rw.innerWidth <= 480) { st.style.width = "min(240px,calc(100vw - 24px))"; st.style.top = "12px"; } } catch(e) {}
+    ipeOverlayHost(d).appendChild(st);
+    try {
+        var rw2 = ipeRootWindow() || window;
+        if (rw2.visualViewport && !rw2.__ipeNoticeVVBound) {
+            rw2.__ipeNoticeVVBound = true;
+            var re = function(){ var s2 = d.getElementById("ipe-notice-stack"); if (s2) ipeNoticeFixPosition(s2); };
+            rw2.visualViewport.addEventListener("resize", re); rw2.visualViewport.addEventListener("scroll", re);
         }
     } catch(e) {}
+    return st;
+}
 
+function ipeNotice(opts) {
+    opts = opts || {};
+    var kind = opts.kind || "error";                       // error | ok | info
+    var sticky = opts.sticky === true;
+    var ms = Number(opts.timeout) || (kind === "error" ? 9000 : 6000);
+    var mist = false; try { mist = cfg().mistTheme === true; } catch(e) {}
+    var d = ipeRootDocument();
+    var stack = ipeNoticeStack();
+
+    var accent = kind === "error" ? (mist ? "#B8756C" : "#D9A19A")
+               : kind === "ok"    ? (mist ? "#7C93A6" : "#9CC5B0")
+               :                    (mist ? "#7C93A6" : "#A9BDD3");
+    var bg  = mist ? "linear-gradient(168deg, rgba(247,248,250,.98) 0%, rgba(236,240,244,.98) 100%)" : "rgba(30,31,36,.94)";
+    var fg  = mist ? "#4A5662" : "#e2e2e2";
+    var sub = mist ? "#6b7a88" : "#b0b0b0";
+    var bd  = mist ? "rgba(140,156,172,.30)" : "rgba(255,255,255,.10)";
+
+    var card = d.createElement("div");
+    card.className = "ipe-notice ipe-notice-" + kind + (mist ? " ipe-mist" : "");
+    card.setAttribute("role", "alert");
+    card.setAttribute("data-ipe-sticky", sticky ? "1" : "0");
+    card.style.cssText = "pointer-events:auto;position:relative;overflow:hidden;border-radius:10px;border:1px solid " + bd
+        + ";border-left:3px solid " + accent + ";background:" + bg + ";color:" + fg
+        + ";box-shadow:0 8px 24px rgba(0,0,0," + (mist ? ".14" : ".40") + ");font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;font-size:11.5px;line-height:1.4;padding:7px 9px 6px"
+        + ";opacity:1;visibility:visible;display:block;max-width:100%;box-sizing:border-box";
+    /* 不用 backdrop-filter、不用 JS 定时把 opacity 从 0 拉到 1：iOS WebKit 对「毛玻璃 + 淡入」偶发不上屏，
+       卡片就存在于 DOM 却看不见。入场动画交给 style.css 的 .ipe-notice 关键帧，CSS 缺了也只是没动画。 */
+    card.innerHTML =
+        '<div style="display:flex;align-items:flex-start;gap:6px">'
+      +   '<span style="font-size:12px;line-height:1.3;flex:none">' + (opts.icon || "🐚") + '</span>'
+      +   '<div style="flex:1;min-width:0">'
+      +     '<div class="ipe-notice-title" style="font-weight:600;font-size:12px;color:' + fg + ';-webkit-text-fill-color:' + fg + '"></div>'
+      +     '<div class="ipe-notice-body" style="margin-top:3px;white-space:pre-wrap;word-break:break-word;color:' + sub + ';-webkit-text-fill-color:' + sub + ';max-height:96px;overflow:auto;-webkit-overflow-scrolling:touch"></div>'
+      +   '</div>'
+      +   '<button type="button" class="ipe-notice-x" aria-label="关闭" style="flex:none;border:0;background:transparent;color:' + sub + ';font-size:16px;line-height:1;cursor:pointer;padding:0 2px;margin:-2px -4px 0 0;font-family:inherit">×</button>'
+      + '</div>'
+      + (sticky
+          ? '<div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px;flex-wrap:wrap">' + ipeNoticeActionsHTML(opts, accent, "3px 10px", "11.5px") + '<button type="button" class="ipe-notice-ok" style="padding:3px 10px;border-radius:7px;border:1px solid ' + accent + ';background:transparent;color:' + accent + ';font-size:11.5px;cursor:pointer;font-family:inherit;line-height:1.5">知道了</button></div>'
+          : '<div class="ipe-notice-bar" style="position:absolute;left:0;bottom:0;height:2px;width:100%;background:' + accent + ';opacity:.55;transform-origin:left center;transform:scaleX(1)"></div>');
+    card.querySelector(".ipe-notice-title").textContent = opts.title || "小海螺";
+    card.querySelector(".ipe-notice-body").textContent  = opts.body  || "";
+
+    var closed = false;
+    function close() {
+        if (closed) return; closed = true;
+        if (card.__ipeTimer) { clearTimeout(card.__ipeTimer); card.__ipeTimer = null; }
+        try { if (card.__ipeMirror && card.__ipeMirror.parentNode) card.__ipeMirror.parentNode.removeChild(card.__ipeMirror); } catch(e) {}
+        try { card.style.transition = "opacity .18s ease, transform .18s ease"; card.style.opacity = "0"; card.style.transform = "translateY(8px)"; } catch(e) {}
+        setTimeout(function(){ try { if (card.parentNode) card.parentNode.removeChild(card); } catch(e) {} }, 200);
+    }
+    card.__ipeClose = close;
+    card.querySelector(".ipe-notice-x").addEventListener("click", close);
+    var okb = card.querySelector(".ipe-notice-ok"); if (okb) okb.addEventListener("click", close);
+    ipeNoticeBindActions(card, opts, close);
+
+    stack.appendChild(card);
+    ipeNoticeFixPosition(stack);
+    /* 自检：挂上去之后量一下。量得到就只有这一张卡；量不到（尺寸为零 / 飞出屏幕）才在面板里补一条镜像横幅，
+       别让人正常情况下看见两份。 */
+    var bad = true;
     try {
-        var d = ipeRootDocument();
-        var old = d.getElementById("ipe-api-failure-popup");
-        if (old && old.parentNode) old.parentNode.removeChild(old);
+        var rc = card.getBoundingClientRect ? card.getBoundingClientRect() : null;
+        var rw3 = ipeRootWindow();
+        var vh3 = (rw3 && rw3.innerHeight) || 0;
+        bad = !rc || rc.width < 10 || rc.height < 10 || (vh3 && (rc.bottom < 0 || rc.top > vh3));
+        if (typeof console !== "undefined") console.log("[IPE] 通知卡", bad ? "⚠ 浮层不可见（已在面板内镜像）" : "✓ 浮层可见", { title: opts.title, rect: rc ? { top: Math.round(rc.top), left: Math.round(rc.left), w: Math.round(rc.width), h: Math.round(rc.height) } : null, doc: d === document ? "self" : "top" });
+    } catch(e) {}
+    if (bad) ipeNoticeMirror(card, opts, accent, close);
 
-        var box = d.createElement("div");
-        box.id = "ipe-api-failure-popup";
-        box.setAttribute("role", "alert");
-        box.style.cssText = [
-            "position:fixed",
-            "right:14px",
-            "bottom:92px",
-            "max-width:min(420px,calc(100vw - 28px))",
-            "z-index:2147483647",
-            "padding:12px 14px",
-            "border-radius:12px",
-            "border:1px solid rgba(255,95,95,.55)",
-            "background:rgba(42,18,24,.96)",
-            "color:#fff",
-            "box-shadow:0 12px 30px rgba(0,0,0,.45)",
-            "font-size:13px",
-            "line-height:1.45",
-            "white-space:pre-wrap",
-            "pointer-events:auto"
-        ].join(";");
+    if (!sticky) {
+        var bar = card.querySelector(".ipe-notice-bar");
+        function arm(dur) {
+            try { if (bar) { bar.style.transition = "none"; bar.style.transform = "scaleX(1)"; } } catch(e) {}
+            setTimeout(function(){ try { if (bar) { bar.style.transition = "transform " + dur + "ms linear"; bar.style.transform = "scaleX(0)"; } } catch(e) {} }, 30);
+            card.__ipeTimer = setTimeout(close, dur);
+        }
+        arm(ms);
+        card.addEventListener("mouseenter", function(){ if (card.__ipeTimer) { clearTimeout(card.__ipeTimer); card.__ipeTimer = null; } try { if (bar) { bar.style.transition = "none"; bar.style.transform = "scaleX(1)"; } } catch(e) {} });
+        card.addEventListener("mouseleave", function(){ if (!closed && !card.__ipeTimer) arm(3000); });
+    }
+    // 最多叠 4 张：老的、非常驻的先走
+    try {
+        var all = stack.querySelectorAll(".ipe-notice");
+        for (var i = 0; i < all.length - 4; i++) if (all[i].getAttribute("data-ipe-sticky") !== "1" && all[i].__ipeClose) all[i].__ipeClose();
+    } catch(e) {}
+    return card;
+}
 
-        var close = d.createElement("button");
-        close.type = "button";
-        close.textContent = "×";
-        close.style.cssText = "float:right;margin:-4px -4px 4px 8px;border:0;background:transparent;color:#fff;font-size:18px;line-height:1;cursor:pointer";
-        close.addEventListener("click", function(){ try { if (box.parentNode) box.parentNode.removeChild(box); } catch(e) {} });
+/* 面板内镜像：浮层卡不管因为什么原因看不见（层级、WebKit 不上屏、被别的插件盖住），
+   面板里那条横幅一定看得见——人报错的时候眼睛就在面板上。浮层关了镜像跟着关，反之亦然。 */
+function ipeNoticeMirror(card, opts, accent, closeAll) {
+    try {
+        var hosts = [];
+        var panel = q("#ipe-panel .ipe-sections"); if (panel) hosts.push(panel);
+        var drawer = q("#ipe-drawer .inline-drawer-content"); if (drawer) hosts.push(drawer);
+        if (!hosts.length) return;
+        var host = hosts[0];
+        var mist = false; try { mist = cfg().mistTheme === true; } catch(e) {}
+        var m = host.ownerDocument.createElement("div");
+        m.className = "ipe-notice-mirror";
+        m.setAttribute("data-ipe-sticky", card.getAttribute("data-ipe-sticky"));
+        m.style.cssText = "margin:8px 12px 2px;padding:10px 12px;border-radius:12px;border:1px solid " + (mist ? "rgba(140,156,172,.30)" : "rgba(255,255,255,.10)")
+            + ";border-left:3px solid " + accent + ";background:" + (mist ? "rgba(255,255,255,.70)" : "rgba(255,255,255,.05)") + ";color:" + (mist ? "#4A5662" : "#dedede")
+            + ";font-size:12.5px;line-height:1.5;display:block";
+        m.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px">'
+            + '<span style="flex:none">' + (opts.icon || "🐚") + '</span>'
+            + '<div style="flex:1;min-width:0"><div class="ipe-notice-title" style="font-weight:600;-webkit-text-fill-color:currentColor"></div><div class="ipe-notice-body" style="margin-top:3px;white-space:pre-wrap;word-break:break-word;opacity:.85;-webkit-text-fill-color:currentColor"></div></div>'
+            + '<button type="button" class="ipe-notice-x" aria-label="关闭" style="flex:none;border:0;background:transparent;color:inherit;opacity:.7;font-size:16px;line-height:1;cursor:pointer;padding:0 2px;font-family:inherit">×</button></div>'
+            + (opts.sticky === true ? '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px;flex-wrap:wrap">' + ipeNoticeActionsHTML(opts, accent, "5px 14px", "12px") + '<button type="button" class="ipe-notice-ok" style="padding:5px 14px;border-radius:9px;border:1px solid ' + accent + ';background:transparent;color:' + accent + ';font-size:12px;cursor:pointer;font-family:inherit">知道了</button></div>' : '');
+        m.querySelector(".ipe-notice-title").textContent = opts.title || "小海螺";
+        m.querySelector(".ipe-notice-body").textContent = opts.body || "";
+        m.querySelector(".ipe-notice-x").addEventListener("click", closeAll);
+        var okb = m.querySelector(".ipe-notice-ok"); if (okb) okb.addEventListener("click", closeAll);
+        ipeNoticeBindActions(m, opts, closeAll);
+        host.insertBefore(m, host.firstChild);
+        card.__ipeMirror = m;
+        // 镜像也最多 4 条
+        var all = host.querySelectorAll(".ipe-notice-mirror");
+        for (var i = all.length - 1; i >= 4; i--) if (all[i].getAttribute("data-ipe-sticky") !== "1" && all[i].parentNode) all[i].parentNode.removeChild(all[i]);
+    } catch(e) {}
+}
 
-        var titleEl = d.createElement("div");
-        titleEl.textContent = title;
-        titleEl.style.cssText = "font-weight:700;margin-bottom:4px;color:#ffb4b4";
+/* 让用户不用真把 API 弄坏就能看一眼报错卡长什么样、在哪儿出现 */
+function ipeNoticeDemo() {
+    var card = ipeShowApiFailurePopup("演示用，账本没有任何变化。真出错时就长这样：常驻不消失，点「知道了」才走。", false,
+        { sticky: true, title: "挂账失败 · 账本还是上一份（演示）" });
+    /* 自检报告写进卡片正文（镜像里也能读到）：浮层到底在哪、多大、哪个文档、算出来的样式是什么 */
+    setTimeout(function(){
+        try {
+            var d = ipeRootDocument(), rw = ipeRootWindow() || window;
+            var st = d.getElementById("ipe-notice-stack");
+            var cs = (card && (d.defaultView || rw).getComputedStyle) ? (d.defaultView || rw).getComputedStyle(card) : null;
+            var ss = (st && (d.defaultView || rw).getComputedStyle) ? (d.defaultView || rw).getComputedStyle(st) : null;
+            var rc = card && card.getBoundingClientRect ? card.getBoundingClientRect() : null;
+            var rs = st && st.getBoundingClientRect ? st.getBoundingClientRect() : null;
+            var vv = rw.visualViewport;
+            var pnl = q("#ipe-panel"); var rp = pnl && pnl.getBoundingClientRect ? pnl.getBoundingClientRect() : null;
+            function r4(x){ return x ? Math.round(x.left) + "," + Math.round(x.top) + " " + Math.round(x.width) + "×" + Math.round(x.height) : "无"; }
+            var lines = [
+                "—— 自检 v" + IPE_VERSION + " ——",
+                "文档: " + (d === document ? "本页" : "顶层") + "　栈父级: " + (st && st.parentNode ? st.parentNode.tagName : "无") + (st && st.__ipePinned ? "（已用像素钉住）" : "") + "　卡片在DOM: " + (card && card.isConnected ? "是" : "否"),
+                "视口: " + rw.innerWidth + "×" + rw.innerHeight + (vv ? "　visualViewport: " + Math.round(vv.width) + "×" + Math.round(vv.height) + " @" + Math.round(vv.offsetLeft) + "," + Math.round(vv.offsetTop) : ""),
+                "栈 rect: " + r4(rs) + "　卡 rect: " + r4(rc) + "　面板 rect: " + r4(rp),
+                ss ? ("栈样式: pos=" + ss.position + " z=" + ss.zIndex + " disp=" + ss.display + " vis=" + ss.visibility + " op=" + ss.opacity + " bottom=" + ss.bottom + " top=" + ss.top) : "栈样式: 拿不到",
+                cs ? ("卡样式: disp=" + cs.display + " vis=" + cs.visibility + " op=" + cs.opacity + " bg=" + cs.backgroundColor) : "卡样式: 拿不到"
+            ];
+            var txt = lines.join("\n");
+            // 自检只进控制台；只有浮层没量到（走了镜像）时才把报告写进镜像正文，方便截图给开发者
+            if (card && card.__ipeMirror) { var b = card.__ipeMirror.querySelector(".ipe-notice-body"); if (b) b.textContent += "\n\n" + txt; }
+            if (typeof console !== "undefined") console.log("[IPE] 通知卡自检\n" + txt);
+        } catch(e) {}
+    }, 120);
+}
 
-        var bodyEl = d.createElement("div");
-        bodyEl.textContent = body;
-
-        box.appendChild(close);
-        box.appendChild(titleEl);
-        box.appendChild(bodyEl);
-        (d.body || d.documentElement).appendChild(box);
-        setTimeout(function(){ try { if (box.parentNode) box.parentNode.removeChild(box); } catch(e) {} }, 10000);
+/* opts.sticky：不自动消失，必须手点。挂账失败用这个——
+   人若没看见弹窗就以为账挂上了，剧情接着走、账本却停在上一楼。
+   生图失败不用：它有自动重试，常驻反而吵。 */
+function ipeShowApiFailurePopup(msg, willRetry, opts) {
+    opts = opts || {};
+    var title = opts.title || "小海螺 · 请求失败";
+    var body = msg || "API 暂时不可用。";
+    if (willRetry) body += "\n10 秒后自动重试一次。";
+    try {
+        return ipeNotice({ kind: "error", title: title, body: body, sticky: opts.sticky === true });
     } catch(e) {
         try { alert(title + "\n" + body); } catch(_) {}
     }
@@ -4256,6 +4487,7 @@ function createPanel() {
             '<button id="ipe-ledger-export" class="ipe-btn" type="button">\u2B07 \u5BFC\u51FA\u8D26\u672C</button>'+
             '<button id="ipe-ledger-import" class="ipe-btn" type="button">\u2B06 \u5BFC\u5165\u8D26\u672C</button>'+
             '<button id="ipe-ledger-ep" class="ipe-btn" type="button">\u{1F50D} \u770B\u8D34\u8033</button>'+
+            '<button id="ipe-notice-demo" class="ipe-btn" type="button" title="看看报错卡长什么样，不动账本">\uD83D\uDD14 试一下报错卡</button>'+
         '</div>'+
         '<input type="file" id="ipe-ledger-file" accept=".json,application/json" style="display:none">'+
         '<div id="ipe-ledger-ep-box" style="display:none;margin-top:6px">'+
@@ -4309,7 +4541,8 @@ function createPanel() {
         '<div class="ipe-preview-actions" style="margin-bottom:8px">'+
             '<button id="ipe-ledger-test" class="ipe-btn" type="button">测试连接</button>'+
         '</div>'+
-        '<div style="color:#888;font-size:12px;margin-bottom:8px"><label style="display:flex;align-items:center;gap:6px;flex-direction:row">自动挂账（每来一楼跑一次） <input type="checkbox" id="ipe-ledger-auto"></label></div>'+
+        '<div style="color:#888;font-size:12px;margin-bottom:8px"><label class="ipe-switch-left" style="display:flex;align-items:center;gap:10px;flex-direction:row;justify-content:flex-start"><input type="checkbox" id="ipe-ledger-auto"> 自动挂账（每来一楼跑一次）</label></div>'+
+        '<div id="ipe-ledger-auto-hint" class="ipe-hint" style="display:none;margin:-2px 0 8px;line-height:1.6"></div>'+
         '<details class="ipe-fold" open><summary>\uD83D\uDCDD 挂账规则（想记什么写在这儿）</summary><div class="ipe-fold-body">'+
         '<label>规则预设<select id="ipe-ledger-prompt-slot"></select></label>'+
         '<label>预设名称<input type="text" id="ipe-ledger-prompt-name" placeholder="例：修仙 / 爱情 / 大世界"></label>'+
@@ -4442,6 +4675,7 @@ function createDrawer() {
        +   '<input type="button" id="iped-ledger-export" class="menu_button" style="flex:1" value="\u2B07 \u5BFC\u51FA\u8D26\u672C">'
        +   '<input type="button" id="iped-ledger-import" class="menu_button" style="flex:1" value="\u2B06 \u5BFC\u5165\u8D26\u672C">'
        +   '<input type="button" id="iped-ledger-ep" class="menu_button" style="flex:1" value="\u{1F50D} \u770B\u8D34\u8033">'
+       +   '<input type="button" id="iped-notice-demo" class="menu_button" style="flex:1" value="\uD83D\uDD14 试一下报错卡">'
        + '</div>';
     h += '<input type="file" id="iped-ledger-file" accept=".json,application/json" style="display:none">';
     h += '<div id="iped-ledger-ep-box" style="display:none;margin-top:6px">'
@@ -4482,7 +4716,8 @@ function createDrawer() {
     h += '<small style="color:#888">思考与正文共用。中转默认值太小会让思考模型交白卷（finish_reason=length），填 16000 之类压过它。</small>';
     h += '<div id="iped-ledger-size" style="color:#888;font-size:11px;margin:4px 0"></div>';
     h += '</div></details>';
-    h += '<div style="margin-bottom:6px"><label>自动挂账（每来一楼跑一次） <input type="checkbox" id="iped-ledger-auto"></label></div>';
+    h += '<div style="margin-bottom:6px"><label class="ipe-switch-left"><input type="checkbox" id="iped-ledger-auto"> 自动挂账（每来一楼跑一次）</label></div>';
+    h += '<div id="iped-ledger-auto-hint" style="display:none;color:#c9a227;font-size:11px;margin:-2px 0 6px;line-height:1.6"></div>';
     h += '<label>挂账规则预设</label><select id="iped-ledger-prompt-slot" class="text_pole"></select>';
     h += '<label>预设名称</label><input type="text" id="iped-ledger-prompt-name" class="text_pole" placeholder="例：修仙 / 爱情 / 大世界">';
     h += '<div style="display:flex;gap:6px;margin-top:6px"><input type="button" id="iped-ledger-prompt-add" class="menu_button" value="新增"><input type="button" id="iped-ledger-prompt-del" class="menu_button" value="删除当前"><input type="button" id="iped-ledger-prompt-reset" class="menu_button" value="恢复默认"></div>';
@@ -4606,13 +4841,7 @@ function ipeImgPackBuild(scope) {
 }
 
 function ipeToast(msg, ok) {
-    try {
-        var w = ipeRootWindow();
-        var t = w && (w.toastr || (w.parent && w.parent.toastr));
-        if (t && typeof t[ok ? "success" : "error"] === "function") {
-            t[ok ? "success" : "error"](msg, "🐚 小海螺", { timeOut: ok ? 6000 : 9000, extendedTimeOut: 2000, closeButton: true });
-        }
-    } catch(e) {}
+    try { ipeNotice({ kind: ok ? "ok" : "error", title: ok ? "小海螺 · 完成" : "小海螺 · 出了点问题", body: msg }); } catch(e) {}
     try { setStatus(msg, ok ? "#6ec577" : "#d4726a"); } catch(e) {}
 }
 
@@ -4840,8 +5069,8 @@ function ipeZoomOpen(ta) {
     ov.addEventListener("click", function(ev){ if (ev.target === ov) done(); });
     ov.__ipeKey = function(ev){ if (ev.key === "Escape") done(); };
     d.addEventListener("keydown", ov.__ipeKey);
-    (d.body || d.documentElement).appendChild(ov);
-    /* iOS 上 top/bottom 拉伸偶尔不生效，遮罩塌成顶上一条灰。挂完实测一下，不够高就用像素硬撑。 */
+    ipeOverlayHost(d).appendChild(ov);
+    /* 挂 <html> 后 fixed 以屏幕为准；下面这段像素兜底仍保留，双保险。 */
     try {
         var rw2 = d.defaultView || ipeRootWindow() || window;
         var vh = Number(rw2.innerHeight) || 0, vw = Number(rw2.innerWidth) || 0;
@@ -5350,6 +5579,10 @@ function bindAll() {
             });
         }
     });
+    ["ipe-notice-demo","iped-notice-demo"].forEach(function(id){
+        var b = q("#" + id);
+        if (b && !b.dataset.ipeBound) { b.dataset.ipeBound = "1"; b.addEventListener("click", function(){ ipeNoticeDemo(); }); }
+    });
     ["ipe-ledger-ep","iped-ledger-ep"].forEach(function(id){
         var b = q("#" + id);
         if (b && !b.dataset.ipeBound) {
@@ -5575,6 +5808,7 @@ function bindAll() {
         var el = q("#" + id); if (!el) return;
         el.addEventListener("change", function(){
             save("ledgerAutoRun", !!el.checked);
+            save("ledgerAutoOffReason", "");          // 人亲手动过开关，之前"插件自己关的"提示就该撤
             ipeLedgerRefreshBotEditors();
             ipeLedgerStatus(el.checked ? "自动挂账已开（每来一楼跑一次）" : "自动挂账已关", "#6ec577");
         });
