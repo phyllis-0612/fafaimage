@@ -4,7 +4,47 @@
  */
 
 const EXT_NAME = "image-prompt-extractor";
-var IPE_VERSION = "2.12.12";
+var IPE_VERSION = "2.14.3";
+/* 内置生图包裹（2.14.0）：默认模板、新建模板的初值、挂账剥标签的兜底，都认这一个。
+   之前是 image###…###；老聊天里已经注入过的 image### 楼仍按 IPE_LEGACY_IMAGE_TEMPLATE 剥，不留脏正文。 */
+var IPE_DEFAULT_IMAGE_TEMPLATE = "<draw>{Description}</draw>";
+var IPE_LEGACY_IMAGE_TEMPLATE  = "image###{Description}###";
+/* 模板里认得的占位符：{Description} 拿整段 / 没单放的层，其余五个是分层占位符 */
+var IPE_IMG_TPL_PH_RE = /\{(?:Description|Camera|Env|Mood|Chars|Pose)\}/g;
+function ipeImgTemplatePlaceholders(t) {
+    var out = [], m;
+    IPE_IMG_TPL_PH_RE.lastIndex = 0;
+    while ((m = IPE_IMG_TPL_PH_RE.exec(String(t || "")))) out.push({ i: m.index, e: m.index + m[0].length });
+    return out;
+}
+/* 模板整体是一对 <xxx>…</xxx> 包着的（默认 <draw>）就返回标签名，否则空串 */
+function ipeImgTemplateEnvelope(t) {
+    var m = String(t || "").match(/^\s*<([A-Za-z][\w-]*)\s*>[\s\S]*<\/\1\s*>\s*$/);
+    return m ? m[1] : "";
+}
+/* 填模板（2.14.1 融合规则）：vals 是 占位符 → 值。
+   多行模板里，某一行的占位符全部填成空，这一整行连同 "Setting:" 这种标签一起不输出。
+   于是一张模板同时服务两条路：分层成功时五行各就各位、{Description} 那行消失；
+   没分层时五行连标签一起消失、整段落在 {Description} 那行。单行模板不收行。
+   用回调替换，desc 里带 $& 之类也不会被 replace 当模式解释。 */
+function ipeImgFillTemplate(tpl, vals) {
+    var lines = String(tpl == null ? "" : tpl).split("\n");
+    var multi = lines.length > 1;
+    var out = [];
+    for (var i = 0; i < lines.length; i++) {
+        var hadPh = false, allEmpty = true;
+        var filled = lines[i].replace(IPE_IMG_TPL_PH_RE, function(m){
+            if (!Object.prototype.hasOwnProperty.call(vals, m)) return m;
+            hadPh = true;
+            var v = String(vals[m] == null ? "" : vals[m]);
+            if (v.trim()) allEmpty = false;
+            return v;
+        });
+        if (multi && hadPh && allEmpty) continue;
+        out.push(filled);
+    }
+    return out.join("\n");
+}
 const DEFAULTS = {
     enabled: true,
     mistTheme: false,   // v1.8.7 开灯：莫兰迪雾蓝浅色皮，默认关（暗色）
@@ -45,7 +85,11 @@ const DEFAULTS = {
     ledgerPromptPresetsJson: "", activeLedgerPrompt: "lp_1",
     ledgerNotePresetsJson: "",   activeLedgerNote: "ln_1",
     ledgerAutoRun: false,
-    ledgerAutoOffReason: "",       // 2.12.4 自动挂账被插件自己关掉的原因：fail（连续失败）/ shrink（疑似事故）；人手动开回去就清空
+    ledgerAutoOffReason: "",
+    ledgerModeEnabled: false,      // 2.13.1 场景模式：与枢轨共用楼尾路由标记
+    ledgerModeTag: "route, ipe_mode", // 新标记优先，兼容 2.13.0 的 <ipe_mode>
+    ledgerPromptNsfwPresetsJson: "", activeLedgerPromptNsfw: "lpn_1",   // 2.13.3 NSFW 槽：自己的预设库，选哪个就是哪个
+    ledgerModeManual: "",          // 手动指定：空 = 自动听标记；"normal" 或某个模式名 = 一直用它       // 2.12.4 自动挂账被插件自己关掉的原因：fail（连续失败）/ shrink（疑似事故）；人手动开回去就清空
     ledgerStream: true,            // 2.10.0 流式接收：思考模型边想边流，中转不会因空闲把连接掐断
     ledgerIdleTimeout: 300,        // 秒。「连续多少秒一个字节都没收到」才判死；0 = 永不
     ledgerReasoningEffort: "",     // reasoning_effort；空 = 不发，用模型默认
@@ -775,9 +819,13 @@ function ipeLedgerHistoryBlock() {
 }
 
 /* ---- 投喂拼装：段落标题只做定位，不声明优先级 ---- */
-/* 生图会把 image###…### 追加进 msg.mes。有 <content> 标签的楼不受影响
+/* 生图会把 <draw>…</draw>（2.14.0 前是 image###…###）追加进 msg.mes。有 <content> 标签的楼不受影响
    （只取标签内），没有标签的楼会兜底返回整条，那串英文 tag 就混进挂账正文了。
-   这里按用户当前所有生图模板的字面前后缀剥掉，模板改了也跟着变。 */
+   这里按用户当前所有生图模板的字面前后缀剥掉，模板改了也跟着变。
+   占位符不只 {Description}：只放 {Camera} {Env} {Mood} {Chars} {Pose} 的分层模板，
+   前缀 = 第一个占位符之前，后缀 = 最后一个占位符之后（以前这种模板整段当字面量找，永远找不到，
+   几千字的风格正文就原样喂进了挂账）。
+   模板整体是 <xxx>…</xxx> 一对标签包着的，直接按标签对剥：模板正文后来改过、旧楼是老版模板注入的，一样认得。 */
 function ipeLedgerStripImageTag(text) {
     var out = String(text || "");
     var tpls = [];
@@ -786,7 +834,8 @@ function ipeLedgerStripImageTag(text) {
         if (Array.isArray(list)) list.forEach(function(x){ if (x && x.value) tpls.push(String(x.value)); });
     } catch(e) {}
     try { if (cfg().baseTemplate) tpls.push(String(cfg().baseTemplate)); } catch(e) {}
-    tpls.push("image###{Description}###");
+    tpls.push(IPE_DEFAULT_IMAGE_TEMPLATE);
+    tpls.push(IPE_LEGACY_IMAGE_TEMPLATE);
 
     var esc = function(x){ return String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); };
     /* 注入永远追加在楼尾（injectDescToMessage 只做 trimEnd + "\n\n" + tag）。
@@ -803,13 +852,26 @@ function ipeLedgerStripImageTag(text) {
         var t = tpls[i];
         if (!t || seen[t]) continue;
         seen[t] = true;
-        var k = t.indexOf("{Description}");
-        if (k < 0) {
+        var phs = ipeImgTemplatePlaceholders(t);
+        if (!phs.length) {
             // buildInjectTag 对无占位符模板是 tpl + desc 直接拼接：整个模板字面量就是前缀
             if (t.trim()) out = stripTail(out, t);
             continue;
         }
-        var pre = t.slice(0, k), suf = t.slice(k + "{Description}".length);
+        var envTag = ipeImgTemplateEnvelope(t);
+        if (envTag) {
+            // <draw>…</draw> 这类整体包裹：按标签对剥，不依赖中间那几千字风格正文一字不差
+            try { out = out.replace(new RegExp("\\s*<" + esc(envTag) + "\\s*>[\\s\\S]*?<\\/" + esc(envTag) + "\\s*>", "g"), ""); } catch(e) {}
+            continue;
+        }
+        var pre = t.slice(0, phs[0].i), suf = t.slice(phs[phs.length - 1].e);
+        if (t.indexOf("\n") >= 0) {
+            // 多行模板：占位符全空的行会被 ipeImgFillTemplate 整行收掉，"Setting: " 这种半行前缀可能不在正文里。
+            // 前缀退到第一个占位符所在行之前、后缀退到最后一个占位符所在行之后，收不收行都对得上。
+            var nl0 = pre.lastIndexOf("\n"), nl1 = suf.indexOf("\n");
+            pre = nl0 >= 0 ? pre.slice(0, nl0 + 1) : "";
+            suf = nl1 >= 0 ? suf.slice(nl1) : "";
+        }
         if (!pre && !suf) continue;
         if (pre && suf) {
             try { out = out.replace(new RegExp("\\s*" + esc(pre) + "[\\s\\S]*?" + esc(suf), "g"), ""); } catch(e) {}
@@ -844,7 +906,7 @@ function ipeLedgerBuildUser(text, extra, atFloor) {
     if (his) u += "\u3010\u8d26\u672c\u5386\u53f2 \u00b7 \u65e7\u2192\u65b0\u3011\n" + his + "\n\n";
 
     u += "\u3010\u5f53\u524d\u697c\u5c42\u3011\u7b2c " + floorNo + " \u697c\n\n";   // 正文取自哪层就报哪层，藏末楼时不再虚报 chat.length
-    u += "\u3010\u672c\u8f6e\u6b63\u6587\u3011\n" + ipeTrimSourceText(ipeLedgerStripImageTag(text));
+    u += "\u3010\u672c\u8f6e\u6b63\u6587\u3011\n" + ipeTrimSourceText(ipeLedgerStripModeTag(ipeLedgerStripImageTag(text)));
     ipeLedgerLastUserChars = u.length;
     return u;
 }
@@ -1006,6 +1068,7 @@ async function ipeLedgerCallAPI(text, extra, atFloor) {
     var item = ipeLedgerApiItem();
     if (!item || !item.endpoint) throw new Error("请先在挂账页选一套 API 预设（地址为空）");
     if (!item.model) throw new Error("这套 API 预设没有选模型");
+    ipeLedgerModeIngest(text, atFloor);      // 先读这楼的场景标记，再拼 system
 
     var headers = { "Content-Type": "application/json" };
     if (item.key) headers["Authorization"] = "Bearer " + item.key;
@@ -1153,6 +1216,7 @@ function ipeLedgerAdoptPreview(which) {
     if (!t) { ipeLedgerStatus("预览是空的，没什么可采用", "#c9a227"); return; }
     var f = ipeLedgerPreviewFloor || 0;   // 预览那份正文取自哪层，就盖哪层
     ipeLedgerCommit(t, f);
+    ipeLedgerModeAfterRun(ipeLedgerPreviewMode);
     ipeLedgerHidePreview();
     ipeLedgerClearExtra();
     ipeLedgerSync();
@@ -1188,6 +1252,7 @@ async function ipeLedgerRunManual() {
     try {
         var ex  = ipeLedgerExtraOnce();
         var out = await ipeLedgerCallAPI(msg.mes, ex, msgFloor);
+        ipeLedgerPreviewMode = ipeLedgerLastMode;
         var got = ipeLedgerExtract(out);          // 有标签顺手剥，没标签原样给
         var body = (got && got.text) ? got.text : String(out || "");
         ipeLedgerShowPreview(body, !got || got.level === 4);
@@ -1285,6 +1350,8 @@ function ipeLedgerSetBusy(on) {
 }
 var ipeLedgerPending = null;      // 缩水拦截暂存，点「强制采用」才落盘
 var ipeLedgerPreviewFloor = 0;    // 预览那份正文取自哪一层，采用时照这个盖戳
+var ipeLedgerPendingMode = "normal"; // 被保护闸拦下的结果实际用了哪套规则
+var ipeLedgerPreviewMode = "normal"; // 手动预览实际用了哪套规则；采用后才消费一次性模式
 
 function ipeLedgerShowForce(on) {
     ["ipe-ledger-force","iped-ledger-force"].forEach(function(id){
@@ -1315,6 +1382,7 @@ async function ipeLedgerRun(targetIdx, silent) {
     ipeLedgerStatus("自动挂账中…（这会儿先别发下一条，贴耳还是上一份）", "#c9a227");
     try {
         var out = await ipeLedgerCallAPI(msg.mes, "", msgFloor);
+        var usedMode = ipeLedgerLastMode;
         var got = ipeLedgerExtract(out);
 
         if (!got || !got.text) {                               // 保底 2/3：整个回复是空的
@@ -1328,6 +1396,7 @@ async function ipeLedgerRun(targetIdx, silent) {
         ipeLedgerFailStreak = 0;
 
         if (body.replace(/\s+/g, "") === IPE_LEDGER_SENTINEL) { // 静默哨兵
+            ipeLedgerModeAfterRun(usedMode);
             ipeLedgerStatus("本轮无变化（第 " + (msgFloor || ipeFloorNo()) + " 楼）" + note, "#6ec577");
             return;
         }
@@ -1337,6 +1406,7 @@ async function ipeLedgerRun(targetIdx, silent) {
         // 兜底级 + 账本原本为空 + 内容极短 → 大概率是拒答/寒暄，压住等确认
         if (got.level === 4 && !oldText.trim() && body.length < IPE_LEDGER_MIN_LEN) {
             ipeLedgerPending = body;
+            ipeLedgerPendingMode = usedMode;
             ipeLedgerShowForce(true);
             ipeLedgerStatus("副 AI 没写包裹，且回复很短（" + body.length + " 字），像是拒答而不是账本，已拦下。"
                 + "确实要用请点「强制采用」。｜原文：" + body.slice(0, 40), "#c9a227");
@@ -1345,6 +1415,7 @@ async function ipeLedgerRun(targetIdx, silent) {
 
         if (oldText.trim() && body.length < oldText.length * IPE_LEDGER_SHRINK) {   // 保底 4
             ipeLedgerPending = body;
+            ipeLedgerPendingMode = usedMode;
             ipeLedgerShowForce(true);
             // 事故现场就该停车等人来看，不能带着警报继续飞
             var wasAuto = cfg().ledgerAutoRun === true;
@@ -1357,7 +1428,8 @@ async function ipeLedgerRun(targetIdx, silent) {
         }
 
         ipeLedgerCommit(body, msgFloor);
-        ipeLedgerStatus("已挂账 \u2713 第 " + (msgFloor || ipeFloorNo()) + " 楼" + note
+        ipeLedgerModeAfterRun(usedMode);
+        ipeLedgerStatus("已挂账 \u2713 第 " + (msgFloor || ipeFloorNo()) + " 楼" + note + (ipeLedgerLastMode !== "normal" ? "｜" + ipeLedgerLastMode + " 槽" + (ipeLedgerNsfwFellBack ? "（内容为空，已用 Normal 槽）" : "") : "")
             + (ipeLedgerReportTruncated ? "（report 层已截断）" : ""),
             got.level === 1 ? "#6ec577" : "#c9a227");
         ipeLedgerSync();
@@ -1912,7 +1984,7 @@ function ipeLedgerPromptHasTag(v) {
 }
 
 // 只包裹，零语义：不说记什么、不说分几层、不说什么格式。
-// 跟生图的 image###...### 同一个性质，只保证输出能被找到。
+// 跟生图的 <draw>…</draw> 同一个性质，只保证输出能被找到。
 // 预设里已经自己写了 <ledger> 就跳过，不重复叮嘱。
 function ipeLedgerWrapHint() {
     var lines = [
@@ -1932,8 +2004,119 @@ function ipeLedgerWrapHint() {
     return lines.join("\n");
 }
 
+/* ============================================================
+   🎭 场景模式路由（2.13.1）
+   不额外叫一个 AI 判断。主 AI 在正文末尾留一个极短标记：
+     <route>normal</route> / <route>nsfw</route> / <route>aftercare</route>
+   插件机械读标记，换用对应的挂账规则预设；模式名和映射全由用户配，插件不关心叫什么。
+   三态语义：
+     · 读到标记 → 切到该模式（只认配过的名字和 normal）
+     · 没标记   → 沿用上一楼的模式，不会因为这楼没写就掉回普通
+     · 一次性模式（如 aftercare）→ 用完一轮自动回 normal
+   手动指定优先于自动；关着就永远 normal。状态存 chat_metadata，换聊天各用各的。
+   标记发给副 AI 前会剥掉；主聊天里的隐藏交给酒馆正则。
+   ============================================================ */
+var IPE_LEDGER_MODE_META = "ipe_ledger_mode_v1";
+var ipeLedgerLastMode = "normal";     // 本次挂账实际用的模式，给状态行报
+
+/* 只有两个槽：normal / nsfw。路由的是槽，不是预设。
+   Normal 槽 = 「挂账规则」面板（预设库 LP，选哪个就是哪个）；
+   NSFW 槽  = 「NSFW 槽 · 挂账规则」面板（自己的预设库 LPN，选哪个就是哪个）。
+   一次只可能用一个槽，标记二选一。 */
+var IPE_LEDGER_KNOWN_MODES = ["nsfw"];
+function ipeLedgerModeTagNames() {
+    var raw = String(cfg().ledgerModeTag || "route, ipe_mode");
+    var parts = raw.split(/[,\s，、]+/), out = [], seen = {};
+    for (var i = 0; i < parts.length; i++) {
+        var t = String(parts[i] || "").trim().replace(/[^\w-]/g, "").toLowerCase();
+        if (t && !seen[t]) { seen[t] = true; out.push(t); }
+    }
+    if (!out.length) out = ["route", "ipe_mode"];
+    /* 2.13.0 的默认值自动升级：新旧标记都认，不掐断旧聊天。自定义标签保持原样。 */
+    if (out.length === 1 && out[0] === "ipe_mode") out.unshift("route");
+    return out;
+}
+function ipeLedgerModeTagName() {
+    return ipeLedgerModeTagNames()[0] || "route";
+}
+function ipeLedgerModeRe() {
+    var tags = ipeLedgerModeTagNames().map(ipeEscRe).join("|");
+    return new RegExp("<\\s*(" + tags + ")\\s*>\\s*([\\w-]+)\\s*<\\s*\\/\\s*\\1\\s*>", "gi");
+}
+function ipeLedgerTailModeMatch(text) {
+    var re = ipeLedgerModeRe(), m, hit = null;
+    var s0 = String(text || "");
+    while ((m = re.exec(s0)) !== null) {
+        if (!s0.slice(re.lastIndex).trim()) hit = { mode: String(m[2] || "").toLowerCase(), index: m.index, end: re.lastIndex };
+    }
+    return hit;
+}
+function ipeLedgerReadModeMarker(text) {
+    var hit = ipeLedgerTailModeMatch(text);
+    return hit ? hit.mode : "";
+}
+function ipeLedgerStripModeTag(text) {
+    var out = String(text || ""), hit;
+    /* 只剥楼尾连续标记；正文中引用的示例标签原样留给副 AI。 */
+    while ((hit = ipeLedgerTailModeMatch(out))) out = out.slice(0, hit.index);
+    return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function ipeLedgerModeState() {
+    try {
+        var r = ipeMetaRoot(); var v = r && r[IPE_LEDGER_MODE_META];
+        if (v && typeof v === "object") return { mode: String(v.mode || "normal").toLowerCase(), floor: Number(v.floor) || 0 };
+    } catch(e) {}
+    return { mode: "normal", floor: 0 };
+}
+function ipeLedgerModeSet(mode, floor) {
+    try {
+        var r = ipeMetaRoot(); if (!r) return;
+        r[IPE_LEDGER_MODE_META] = { mode: String(mode || "normal").toLowerCase(), floor: Number(floor) || 0, updatedAt: Date.now() };
+        var c = ctx(); if (c && typeof c.saveMetadataDebounced === "function") c.saveMetadataDebounced();
+    } catch(e) {}
+}
+function ipeLedgerModeItem(name) {
+    var n = String(name || "").toLowerCase();
+    return IPE_LEDGER_KNOWN_MODES.indexOf(n) >= 0 ? { name: n } : null;
+}
+/* 当前生效模式：手动优先，其次自动状态；关着就 normal */
+function ipeLedgerModeEffective() {
+    if (cfg().ledgerModeEnabled !== true) return "normal";
+    var man = String(cfg().ledgerModeManual || "").trim().toLowerCase();
+    if (man) return man;
+    return ipeLedgerModeState().mode || "normal";
+}
+var ipeLedgerNsfwFellBack = false;   // NSFW 槽选的预设是空的 → 这一轮回落到 Normal，状态行提示
+function ipeLedgerPromptValueForMode(mode) {
+    var m = String(mode || "normal").toLowerCase();
+    ipeLedgerNsfwFellBack = false;
+    if (m === "nsfw") {
+        var v = String(ipePresetItem.apply(null, LPN).value || "").trim();
+        if (v) return v;
+        ipeLedgerNsfwFellBack = true;
+    }
+    return ipeLedgerPromptValue();
+}
+/* 一楼正文进来：读标记、更新状态。返回本次生效的模式。 */
+function ipeLedgerModeIngest(text, floor) {
+    if (cfg().ledgerModeEnabled !== true) { ipeLedgerLastMode = "normal"; return "normal"; }
+    var source = text;
+    try { source = ipeLedgerStripImageTag(text); } catch(e) {}
+    var mk = ipeLedgerReadModeMarker(source);
+    if (mk && (mk === "normal" || ipeLedgerModeItem(mk))) ipeLedgerModeSet(mk, floor);
+    ipeLedgerLastMode = ipeLedgerModeEffective();
+    return ipeLedgerLastMode;
+}
+/* 一次挂账跑成：一次性模式自动回普通（只动自动状态，不动手动指定） */
+function ipeLedgerModeAfterRun(usedMode) { /* 2.13.3 起没有一次性模式；保留签名给各调用点 */ }
+function ipeLedgerModeSnippet() {
+    var t = ipeLedgerModeTagName();
+    var opts = ["normal"].concat(IPE_LEDGER_KNOWN_MODES).map(function(n){ return "<" + t + ">" + n + "</" + t + ">"; }).join("、");
+    return "每轮正文的最后一行，预测下一轮回复应使用的预设模式，并单独输出一个标记：" + opts + "。根据当前情节走向判断：下一轮即将进入或仍处于亲密场景时写 nsfw；下一轮应回到常规场景时写 normal。必须提前一轮切换，不要等场景已经写出后才标记。标记之外不要解释。";
+}
+
 function ipeLedgerSystemText() {
-    var v = ipeLedgerPromptValue();
+    var v = ipeLedgerPromptValueForMode(ipeLedgerModeEffective());
     return ipeLedgerPromptHasTag(v) ? v : (v + "\n" + ipeLedgerWrapHint());
 }
 
@@ -2002,7 +2185,9 @@ function ipePresetDelete(jsonKey, activeKey, seedId, seedName, seedValue) {
 
 var LP = ["ledgerPromptPresetsJson","activeLedgerPrompt","lp_1","飞地·大事件挂账", IPE_LEDGER_PROMPT_DEFAULT];
 var LN = ["ledgerNotePresetsJson","activeLedgerNote","ln_1","本卡要点", IPE_LEDGER_NOTE_DEFAULT];
+var LPN = ["ledgerPromptNsfwPresetsJson","activeLedgerPromptNsfw","lpn_1","NSFW 挂账规则", ""];   // NSFW 槽自己的库
 function ipeLedgerPromptValue(){ return ipePresetItem.apply(null, LP).value || IPE_LEDGER_PROMPT_DEFAULT; }
+function ipeLedgerPromptNsfwValue(){ return ipePresetItem.apply(null, LPN).value || ""; }
 function ipeLedgerNoteValue(){ return ipePresetItem.apply(null, LN).value || ""; }
 
 /* ---- 状态行 ---- */
@@ -2013,10 +2198,68 @@ function ipeLedgerStatus(t, color) {
 }
 
 /* ---- 版本信息（取代 v1 的账龄栏）---- */
+/* 场景模式 UI：面板 ipe- / 抽屉 iped- 同一套 */
+function ipeLedgerModeRefresh() {
+    var on = cfg().ledgerModeEnabled === true;
+    var doc = ipeRootDocument();
+    ["ipe","iped"].forEach(function(pre){
+        var cb = q("#" + pre + "-ledger-mode-on"); if (cb) cb.checked = on;
+        var tg = q("#" + pre + "-ledger-mode-tag"); if (tg && doc.activeElement !== tg) tg.value = ipeLedgerModeTagNames().join(", ");
+        var sel = q("#" + pre + "-ledger-mode-manual");
+        if (sel) {
+            sel.innerHTML = '<option value="">自动（听标记）</option><option value="normal">锁定 normal</option><option value="nsfw">锁定 nsfw</option>';
+            sel.value = String(cfg().ledgerModeManual || "");
+        }
+        var fold = q("#" + pre + "-ledger-nsfw-fold"); if (fold) fold.style.display = on ? "" : "none";   // 关着就藏
+        var sn = q("#" + pre + "-ledger-mode-snippet"); if (sn) sn.value = ipeLedgerModeSnippet();
+        var now = q("#" + pre + "-ledger-mode-now");
+        if (now) {
+            var eff = ipeLedgerModeEffective();
+            var normalName = (ipePresetItem.apply(null, LP) || {}).name || "?";
+            var nsfwItem = ipePresetItem.apply(null, LPN) || {};
+            var nsfwName = (nsfwItem.name || "?") + (String(nsfwItem.value || "").trim() ? "" : "（内容为空，会回落到 Normal）");
+            now.textContent = on
+                ? ("当前生效：" + eff + (String(cfg().ledgerModeManual || "").trim() ? "（手动锁定）" : "（自动，本聊天记忆）") + "　｜　Normal 槽 → " + normalName + "　NSFW 槽 → " + nsfwName)
+                : "场景模式未启用：一直用 Normal 槽 → " + normalName;
+        }
+    });
+}
+function ipeLedgerModeBind() {
+    ["ipe","iped"].forEach(function(pre){
+        var cb = q("#" + pre + "-ledger-mode-on");
+        if (cb && !cb.__ipeBound) { cb.__ipeBound = true; cb.addEventListener("change", function(){
+            save("ledgerModeEnabled", !!cb.checked); ipeLedgerRefreshBotEditors();
+            ipeLedgerStatus(cb.checked ? "场景模式已启用：楼尾标记决定用 Normal 槽还是 NSFW 槽" : "场景模式已关：一直用 Normal 槽", "#6ec577");
+        }); }
+        var tg = q("#" + pre + "-ledger-mode-tag");
+        if (tg && !tg.__ipeBound) { tg.__ipeBound = true; tg.addEventListener("change", function(){
+            var raw = String(tg.value || "").split(/[,\s，、]+/), clean = [], seen = {};
+            for (var i = 0; i < raw.length; i++) {
+                var tag = String(raw[i] || "").trim().replace(/[^\w-]/g, "").toLowerCase();
+                if (tag && !seen[tag]) { seen[tag] = true; clean.push(tag); }
+            }
+            var v = clean.length ? clean.join(", ") : "route, ipe_mode";
+            save("ledgerModeTag", v); ipeLedgerRefreshBotEditors();
+        }); }
+        var sel = q("#" + pre + "-ledger-mode-manual");
+        if (sel && !sel.__ipeBound) { sel.__ipeBound = true; sel.addEventListener("change", function(){
+            save("ledgerModeManual", String(sel.value || "")); ipeLedgerRefreshBotEditors();
+            ipeLedgerStatus(sel.value ? "已锁定 " + sel.value + " 槽，改回「自动」才会听标记" : "已改回自动，听楼尾标记", "#6ec577");
+        }); }
+    });
+}
+
 function ipeLedgerVersionInfo() {
     var st = ipeLedgerRead();
+    var modeNote = "";
+    try {
+        if (cfg().ledgerModeEnabled === true) {
+            var man = String(cfg().ledgerModeManual || "").trim();
+            modeNote = "\u3000模式 " + ipeLedgerModeEffective() + (man ? "（手动）" : "（自动）");
+        }
+    } catch(e) {}
     return "当前 " + ipeFloorNo() + " 楼\u3000历史 " + st.versions.length + " 版\u3000"
-         + (st.lastFloor >= 0 ? "最后更新于第 " + st.lastFloor + " 楼" : "尚未挂过账");
+         + (st.lastFloor >= 0 ? "最后更新于第 " + st.lastFloor + " 楼" : "尚未挂过账") + modeNote;
 }
 
 function ipeLedgerRefreshEditors() {
@@ -2072,6 +2315,7 @@ function ipeLedgerRefreshBotEditors() {
     ipeLedgerUpgradePrompts();
     var pv = ipePresetItem.apply(null, LP);
     var nv = ipePresetItem.apply(null, LN);
+    var pnv = ipePresetItem.apply(null, LPN);
     var apiList = ipeGetApiProfiles();
     var apiId = cfg().ledgerApiProfile || "";
     var doc = ipeRootDocument();
@@ -2089,8 +2333,12 @@ function ipeLedgerRefreshBotEditors() {
     ipeFillSelect("iped-ledger-prompt-slot", ipePresetList.apply(null, LP), pv.id);
     ipeFillSelect("ipe-ledger-note-slot",    ipePresetList.apply(null, LN), nv.id);
     ipeFillSelect("iped-ledger-note-slot",   ipePresetList.apply(null, LN), nv.id);
+    ipeFillSelect("ipe-ledger-prompt-n-slot",  ipePresetList.apply(null, LPN), pnv.id);
+    ipeFillSelect("iped-ledger-prompt-n-slot", ipePresetList.apply(null, LPN), pnv.id);
 
-    [["ipe-ledger-prompt", pv.value || IPE_LEDGER_PROMPT_DEFAULT], ["iped-ledger-prompt", pv.value || IPE_LEDGER_PROMPT_DEFAULT],
+    [["ipe-ledger-prompt-n", pnv.value || ""], ["iped-ledger-prompt-n", pnv.value || ""],
+     ["ipe-ledger-prompt-n-name", pnv.name || ""], ["iped-ledger-prompt-n-name", pnv.name || ""],
+     ["ipe-ledger-prompt", pv.value || IPE_LEDGER_PROMPT_DEFAULT], ["iped-ledger-prompt", pv.value || IPE_LEDGER_PROMPT_DEFAULT],
      ["ipe-ledger-prompt-name", pv.name || ""], ["iped-ledger-prompt-name", pv.name || ""],
      ["ipe-ledger-note", nv.value || ""], ["iped-ledger-note", nv.value || ""],
      ["ipe-ledger-note-name", nv.name || ""], ["iped-ledger-note-name", nv.name || ""],
@@ -2121,6 +2369,7 @@ function ipeLedgerRefreshBotEditors() {
         // 开关在左：老 style.css 里那条 space-between !important 会把它推回右边，这里用 important 压回来
         try { if (el.parentNode && el.parentNode.tagName === "LABEL") el.parentNode.style.setProperty("justify-content", "flex-start", "important"); } catch(e) {}
     });
+    try { ipeLedgerModeRefresh(); } catch(eM) {}
     ["ipe-ledger-auto-hint","iped-ledger-auto-hint"].forEach(function(id){
         var el = q("#" + id); if (!el) return;
         var reason = String(cfg().ledgerAutoOffReason || "");
@@ -2417,13 +2666,13 @@ function ipeRefreshApiProfileEditors() {
     ipeFillSelect("iped-api-profile", list, active);
 
     ["ipe-api-profile-name","iped-api-profile-name"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.name || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.name || "";
     });
     ["ipe-api-endpoint","iped-api-endpoint"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.endpoint || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.endpoint || "";
     });
     ["ipe-api-key","iped-api-key"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.key || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.key || "";
     });
 
     ipeEnsureModelOption("ipe-model", item.model || "");
@@ -2513,7 +2762,7 @@ function ipeSetTemplateName(val) {
 function ipeAddTemplatePreset() {
     var list = ipeGetBaseTemplates();
     var id = ipeMakeId("tpl");
-    list.push({ id: id, name: "新模板" + (list.length + 1), value: "image###{Description}###" });
+    list.push({ id: id, name: "新模板" + (list.length + 1), value: IPE_DEFAULT_IMAGE_TEMPLATE });
     ipeSaveBaseTemplates(list);
     saveCritical("activeBaseTemplate", id);
     ipeRefreshSystemPromptEditors();
@@ -2723,7 +2972,7 @@ function ipeRefreshSystemPromptEditors() {
     ipeFillSelect("iped-system-slot", list, active);
 
     ["ipe-system-prompt","iped-system-prompt"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.value || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.value || "";
     });
 }
 
@@ -2848,10 +3097,10 @@ function ipeRefreshRuleEditors() {
     ipeFillSelect("iped-rule-slot", list, active);
 
     ["ipe-rule-name","iped-rule-name"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.name || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.name || "";
     });
     ["ipe-extract-rules","iped-extract-rules"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.value || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.value || "";
     });
 }
 
@@ -2886,6 +3135,11 @@ function ipeFillSelect(id, list, active) {
     }
 }
 
+/* 2.14.3 名字框回写守卫：各刷新函数不再往 document.activeElement（正在打字的那个框）写 value。
+   之前每敲一个字就 存 → 整面刷新 → 把存下来的名字写回正在打字的框：
+   清空的瞬间存的是兜底名「模板33」，被写回去，iOS 输入法再把「你好」接在后面 = 「模板33你好」；
+   写 value 也会打断输入法合成。挂账那边的 ipeLedgerRefreshBotEditors 早有这道守卫，生图这边补齐。
+   兜底名只在 change（离开输入框）时写回。 */
 function ipeRefreshTemplateEditors() {
     var list = ipeGetBaseTemplates();
     var active = ipeGetActiveTemplateId();
@@ -2895,10 +3149,10 @@ function ipeRefreshTemplateEditors() {
     ipeFillSelect("iped-template-slot", list, active);
 
     ["ipe-template-name","iped-template-name"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.name || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.name || "";
     });
     ["ipe-base-template","iped-base-template"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.value || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.value || "";
     });
 }
 
@@ -2911,13 +3165,13 @@ function ipeRefreshAnchorEditors() {
     ipeFillSelect("iped-anchor-slot", list, active);
 
     ["ipe-anchor-name","iped-anchor-name"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.name || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.name || "";
     });
     ["ipe-char-anchors","iped-char-anchors"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = item.value || "";
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.value || "";
     });
     ["ipe-anchor-guide-editor","iped-anchor-guide-editor"].forEach(function(id){
-        var el = q("#" + id); if (el) el.value = ipeGetAnchorUsageGuide();
+        var el = q("#" + id); if (el && el !== document.activeElement) el.value = ipeGetAnchorUsageGuide();
     });
 }
 
@@ -3316,7 +3570,10 @@ function ipeImgPrevLayers(locks) {
     var out = { floor: st ? Number(st.floor) || 0 : 0, envFloor: st ? Number(st.envFloor || st.floor) || 0 : 0, moodFloor: st ? Number(st.moodFloor || st.floor) || 0 : 0 };
     IPE_IMG_LAYERS.forEach(function(l){
         var stored = st ? String(st[l] || "").trim() : "";
-        out[l] = (locks && locks[l] && box[l]) ? box[l] : stored;
+        if (ipeImgIsNoChange(stored)) stored = "";              // 存档里是哨兵字面量：当没有，不喂给副 AI
+        var boxV = String(box[l] || "").trim();
+        if (ipeImgIsNoChange(boxV)) boxV = "";
+        out[l] = (locks && locks[l] && boxV) ? boxV : stored;
     });
     return out;
 }
@@ -3368,7 +3625,12 @@ function ipeImgParseLayers(txt) {
     return out;
 }
 
-function ipeImgIsNoChange(v) { return String(v || "").replace(/\s+/g, "").toUpperCase() === IPE_IMG_NOCHANGE; }
+/* 副 AI 写 NO_CHANGE 时常带句号、引号、反引号或把下划线写成空格（"NO_CHANGE." / "`NO_CHANGE`" / "No change"）。
+   2.14.2 前只认一字不差的 NO_CHANGE，"NO_CHANGE." 就当成真环境描述落框、拼进提示词，
+   还会存进上一楼记忆、下一楼继续沿用——截图里 NO_CHANGE. NO_CHANGE. 就是这么来的。 */
+function ipeImgIsNoChange(v) {
+    return String(v || "").replace(/[\s"'`*_\-.。!！,，;；:：()（）\[\]]/g, "").toUpperCase() === "NOCHANGE";
+}
 
 /* 合账：锁定层用旧值；NO_CHANGE 或空 → 有旧值就沿用；否则收新值 */
 function ipeImgMergeLayers(parsed, prev, locks, floor) {
@@ -3376,6 +3638,7 @@ function ipeImgMergeLayers(parsed, prev, locks, floor) {
     IPE_IMG_LAYERS.forEach(function(l){
         var v = String((parsed && parsed[l]) || "").trim();
         var prevV = prev ? String(prev[l] || "").trim() : "";
+        if (ipeImgIsNoChange(prevV)) prevV = "";                // 老版本存下来的 "NO_CHANGE." 不算上一楼内容，不再往下传
         var label = IPE_IMG_LAYER_LABEL[l] || l;
         var fk = l + "Floor";                                   // envFloor / moodFloor：这层内容来自哪一楼
         var prevFloor = prev ? (Number(prev[fk]) || Number(prev.floor) || 0) : 0;
@@ -4398,8 +4661,8 @@ function createPanel() {
             '<button id="ipe-template-add" class="ipe-btn" type="button">新增模板</button>'+
             '<button id="ipe-template-delete" class="ipe-btn" type="button">删除当前</button>'+
         '</div>'+
-        '<textarea id="ipe-base-template" rows="6" placeholder="image###...{Description}...###"></textarea>'+
-        '<div class="ipe-hint">可无限新增模板。用 {Description} 标记描述文本的插入位置；分层模式可用 {Camera} {Env} {Mood} {Chars} {Pose}</div>'+
+        '<textarea id="ipe-base-template" rows="6" placeholder="&lt;draw&gt;{Description}&lt;/draw&gt;"></textarea>'+
+        '<div class="ipe-hint">可无限新增模板。留空即用内置 &lt;draw&gt;{Description}&lt;/draw&gt;。用 {Description} 标记描述文本的插入位置；分层模式可用 {Camera} {Env} {Mood} {Chars} {Pose}，整段用 &lt;draw&gt;…&lt;/draw&gt; 包住，挂账时按标签对剥干净。两种都写也行：哪一行的占位符全空，那一整行连标签一起不输出，分层与整段共用一张模板</div>'+
         '<div class="ipe-preview-actions" style="margin-top:8px">'+
             '<button id="ipe-pack-export" class="ipe-btn" type="button">\u2B07 导出全部预设包</button>'+
             '<button id="ipe-pack-export-cur" class="ipe-btn" type="button">\u2B07 只导出当前这套</button>'+
@@ -4517,6 +4780,9 @@ function createPanel() {
         '<div style="font-weight:600;font-size:12px;margin-bottom:6px">\uD83E\uDD16 副 AI（谁来记账）</div>'+
         '<label>挂账用哪套 API<select id="ipe-ledger-api"></select></label>'+
         '<div class="ipe-hint" style="margin-bottom:6px">在生图页配好地址密钥，这儿选一套用。跟生图各用各的，不打架。</div>'+
+        '<div class="ipe-preview-actions" style="margin-bottom:8px">'+
+            '<button id="ipe-ledger-test" class="ipe-btn" type="button">测试连接（测的是上面这套 API）</button>'+
+        '</div>'+
         '<details class="ipe-fold"><summary>\u2699\uFE0F 高级设置（不懂就别动，默认就挺好）</summary><div class="ipe-fold-body">'+
             '<div class="ipe-hint">副 AI 每次能看到：本卡要点 + User 指令 + 最近几楼摘要 + 最近几版账本 + 楼层数 + 这一楼正文。不看角色卡和世界书。</div>'+
             '<label>让它往回看几楼（0 = 不看）<input type="text" inputmode="numeric" id="ipe-ledger-rep-floors" placeholder="10"></label>'+
@@ -4539,9 +4805,26 @@ function createPanel() {
             '<div class="ipe-hint">思考 token 和正文共用这个上限。中转给的默认值太小时，思考模型会把额度想光、正文交白卷（状态行会报 finish_reason=length）。填 16000 之类的大数压过它。</div>'+
             '<div id="ipe-ledger-size" class="ipe-hint" style="margin-top:6px"></div>'+
         '</div></details>'+
-        '<div class="ipe-preview-actions" style="margin-bottom:8px">'+
-            '<button id="ipe-ledger-test" class="ipe-btn" type="button">测试连接</button>'+
+        '<details class="ipe-fold" id="ipe-ledger-nsfw-fold" style="display:none" open><summary>\uD83D\uDD1E NSFW 槽 · 挂账规则（标记为 nsfw 时用这套）</summary><div class="ipe-fold-body">'+
+        '<label>规则预设<select id="ipe-ledger-prompt-n-slot"></select></label>'+
+        '<label>预设名称<input type="text" id="ipe-ledger-prompt-n-name" placeholder="例：现代 NSFW / 古代 NSFW"></label>'+
+        '<div class="ipe-preview-actions" style="margin-top:2px">'+
+            '<button id="ipe-ledger-prompt-n-add" class="ipe-btn" type="button">新增</button>'+
+            '<button id="ipe-ledger-prompt-n-del" class="ipe-btn" type="button">删除当前</button>'+
         '</div>'+
+        '<textarea id="ipe-ledger-prompt-n" rows="7" placeholder="亲密场景下副 AI 该怎么记账。留空则回落到 Normal 槽。"></textarea>'+
+        '<div class="ipe-hint">这个槽有自己的预设库，跟上面 Normal 槽互不混。一次只用一个槽：楼尾标记 nsfw 用这套，normal 用上面那套。</div>'+
+        '</div></details>'+
+        '<details class="ipe-fold"><summary>\uD83C\uDFAD 场景模式（楼尾标记二选一：Normal 槽 / NSFW 槽）</summary><div class="ipe-fold-body">'+
+            '<div style="color:#888;font-size:12px"><label class="ipe-switch-left" style="display:flex;align-items:center;gap:10px;flex-direction:row;justify-content:flex-start"><input type="checkbox" id="ipe-ledger-mode-on"> 启用场景模式（开了才出现 NSFW 槽）</label></div>'+
+            '<div class="ipe-hint">与枢轨共用楼尾标记 &lt;route&gt;nsfw&lt;/route&gt; / &lt;route&gt;normal&lt;/route&gt;。小海螺据此在两个槽之间二选一，枢轨据此换整套预设。没标记沿用上一楼。默认也兼容旧 &lt;ipe_mode&gt;，正文里引用标签不会误触，标记发给副 AI 前会剥掉。</div>'+
+            '<label>监听标签名（逗号分隔）<input type="text" id="ipe-ledger-mode-tag" placeholder="route, ipe_mode"></label>'+
+            '<label>手动锁定<select id="ipe-ledger-mode-manual"></select></label>'+
+            '<div class="ipe-hint">「自动」= 听标记。锁定某个槽就一直用它，模型判断错了拨这个纠正，改回自动继续听。</div>'+
+            '<label style="margin-top:8px">给主 AI 的那几句（复制进常驻区）</label>'+
+            '<textarea id="ipe-ledger-mode-snippet" rows="4" readonly></textarea>'+
+            '<div id="ipe-ledger-mode-now" class="ipe-hint"></div>'+
+        '</div></details>'+
         '<div style="color:#888;font-size:12px;margin-bottom:8px"><label class="ipe-switch-left" style="display:flex;align-items:center;gap:10px;flex-direction:row;justify-content:flex-start"><input type="checkbox" id="ipe-ledger-auto"> 自动挂账（每来一楼跑一次）</label></div>'+
         '<div id="ipe-ledger-auto-hint" class="ipe-hint" style="display:none;margin:-2px 0 8px;line-height:1.6"></div>'+
         '<details class="ipe-fold" open><summary>\uD83D\uDCDD 挂账规则（想记什么写在这儿）</summary><div class="ipe-fold-body">'+
@@ -4624,8 +4907,8 @@ function createDrawer() {
     h += '<label>模板预设</label><select id="iped-template-slot" class="text_pole"></select>';
     h += '<label>模板名称</label><input type="text" id="iped-template-name" class="text_pole" value="" placeholder="例如：乙游CG">';
     h += '<div style="display:flex;gap:6px;margin-top:6px"><input type="button" id="iped-template-add" class="menu_button" value="新增模板"><input type="button" id="iped-template-delete" class="menu_button" value="删除当前"></div>';
-    h += '<textarea id="iped-base-template" class="text_pole" rows="5" placeholder="image###...{Description}...###"></textarea>';
-    h += '<small style="color:#888">可无限新增模板。用 {Description} 标记插入位置；分层可用 {Camera} {Env} {Mood} {Chars} {Pose}</small>';
+    h += '<textarea id="iped-base-template" class="text_pole" rows="5" placeholder="&lt;draw&gt;{Description}&lt;/draw&gt;"></textarea>';
+    h += '<small style="color:#888">可无限新增模板。留空即用内置 &lt;draw&gt;{Description}&lt;/draw&gt;。用 {Description} 标记插入位置；分层可用 {Camera} {Env} {Mood} {Chars} {Pose}，整段用 &lt;draw&gt;…&lt;/draw&gt; 包住。两种都写也行：占位符全空的行整行不输出</small>';
     h += '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><input type="button" id="iped-pack-export" class="menu_button" value="\u2B07 导出全部预设包"><input type="button" id="iped-pack-export-cur" class="menu_button" value="\u2B07 只导出当前这套"><input type="button" id="iped-pack-import" class="menu_button" value="\u2B06 导入预设包"></div>';
     h += '<input type="file" id="iped-pack-file" accept=".json,application/json" style="display:none">';
     h += '<small style="color:#888">包里装模板 / 规则 / 系统提示 / 通用锚点规则，不含角色锚点、API 与密钥；导入按名字合并，同名覆盖前会问。锚点备份在锚点区。</small>';
@@ -4716,6 +4999,21 @@ function createDrawer() {
     h += '<label>输出上限（token，0 = 不发）</label><input type="text" id="iped-ledger-maxtok" class="text_pole" placeholder="0">';
     h += '<small style="color:#888">思考与正文共用。中转默认值太小会让思考模型交白卷（finish_reason=length），填 16000 之类压过它。</small>';
     h += '<div id="iped-ledger-size" style="color:#888;font-size:11px;margin:4px 0"></div>';
+    h += '</div></details>';
+    h += '<details class="ipe-fold" id="iped-ledger-nsfw-fold" style="display:none" open><summary>\uD83D\uDD1E NSFW 槽 · 挂账规则（标记为 nsfw 时用这套）</summary><div class="ipe-fold-body">';
+    h += '<label>规则预设</label><select id="iped-ledger-prompt-n-slot" class="text_pole"></select>';
+    h += '<label>预设名称</label><input type="text" id="iped-ledger-prompt-n-name" class="text_pole" placeholder="例：现代 NSFW / 古代 NSFW">';
+    h += '<div style="display:flex;gap:6px;margin-top:6px"><input type="button" id="iped-ledger-prompt-n-add" class="menu_button" value="新增"><input type="button" id="iped-ledger-prompt-n-del" class="menu_button" value="删除当前"></div>';
+    h += '<textarea id="iped-ledger-prompt-n" class="text_pole" rows="6" placeholder="亲密场景下副 AI 该怎么记账。留空则回落到 Normal 槽。"></textarea>';
+    h += '<small style="color:#888">自己的预设库，跟 Normal 槽互不混；楼尾标记 nsfw 用这套。</small>';
+    h += '</div></details>';
+    h += '<details class="ipe-fold"><summary>\uD83C\uDFAD 场景模式（楼尾标记二选一：Normal 槽 / NSFW 槽）</summary><div class="ipe-fold-body">';
+    h += '<div style="margin-bottom:6px"><label class="ipe-switch-left"><input type="checkbox" id="iped-ledger-mode-on"> 启用场景模式（开了才出现 NSFW 槽）</label></div>';
+    h += '<small style="color:#888">与枢轨共用楼尾 &lt;route&gt;nsfw&lt;/route&gt; / &lt;route&gt;normal&lt;/route&gt;，两个槽二选一；没标记沿用；兼容旧 &lt;ipe_mode&gt;。</small>';
+    h += '<label>监听标签名（逗号分隔）</label><input type="text" id="iped-ledger-mode-tag" class="text_pole" placeholder="route, ipe_mode">';
+    h += '<label>手动锁定</label><select id="iped-ledger-mode-manual" class="text_pole"></select>';
+    h += '<label>给主 AI 的那几句（复制进常驻区）</label><textarea id="iped-ledger-mode-snippet" class="text_pole" rows="4" readonly></textarea>';
+    h += '<div id="iped-ledger-mode-now" style="color:#888;font-size:11px;margin:4px 0"></div>';
     h += '</div></details>';
     h += '<div style="margin-bottom:6px"><label class="ipe-switch-left"><input type="checkbox" id="iped-ledger-auto"> 自动挂账（每来一楼跑一次）</label></div>';
     h += '<div id="iped-ledger-auto-hint" style="display:none;color:#c9a227;font-size:11px;margin:-2px 0 6px;line-height:1.6"></div>';
@@ -5188,6 +5486,8 @@ function bindAll() {
         el.addEventListener("change", function(){
             ipeSetApiProfileName(el.value);
             ipeSaveNow();
+            var nm = ipeGetActiveApiProfileItem().name || "";
+            if (el.value !== nm) el.value = nm;
             ipeRefreshApiProfileEditors();
         });
     });
@@ -5261,6 +5561,9 @@ function bindAll() {
         el.addEventListener("change", function(){
             ipeSetTemplateName(el.value);
             ipeSaveNow();
+            var nm = ipeGetActiveTemplateItem().name || "";
+            if (el.value !== nm) el.value = nm;   // 清空后离开：这时才把兜底名写回来
+            ipeRefreshTemplateEditors();
         });
     });
 
@@ -5304,6 +5607,9 @@ function bindAll() {
         el.addEventListener("change", function(){
             ipeSetAnchorName(el.value);
             ipeSaveNow();
+            var nm = ipeGetActiveAnchorItem().name || "";
+            if (el.value !== nm) el.value = nm;
+            ipeRefreshAnchorEditors();
         });
     });
 
@@ -5370,6 +5676,9 @@ function bindAll() {
         el.addEventListener("change", function(){
             ipeSetRuleName(el.value);
             ipeSaveNow();
+            var nm = ipeGetActiveRuleItem().name || "";
+            if (el.value !== nm) el.value = nm;
+            ipeRefreshRuleEditors();
         });
     });
 
@@ -5602,6 +5911,7 @@ function bindAll() {
             });
         }
     });
+    try { ipeLedgerModeBind(); } catch(eMB) {}
     ["ipe-notice-demo","iped-notice-demo"].forEach(function(id){
         var b = q("#" + id);
         if (b && !b.dataset.ipeBound) { b.dataset.ipeBound = "1"; b.addEventListener("click", function(){ ipeNoticeDemo(); }); }
@@ -5625,6 +5935,7 @@ function bindAll() {
         el.addEventListener("click", function(){
             if (ipeLedgerPending == null) { ipeLedgerStatus("没有待确认的结果", "#c9a227"); return; }
             ipeLedgerCommit(ipeLedgerPending, ipeLedgerPreviewFloor || 0);
+            ipeLedgerModeAfterRun(ipeLedgerPendingMode);
             ipeLedgerPending = null;
             ipeLedgerShowForce(false);
             ipeLedgerSync();
@@ -5839,6 +6150,7 @@ function bindAll() {
 
     // 两套预设：值 / 名称 / 新增 / 删除
     [["ipe-ledger-prompt", LP], ["iped-ledger-prompt", LP],
+     ["ipe-ledger-prompt-n", LPN], ["iped-ledger-prompt-n", LPN],
      ["ipe-ledger-note", LN],   ["iped-ledger-note", LN]].forEach(function(pr){
         var el = q("#" + pr[0]); if (!el) return;
         el.addEventListener("input", function(){
@@ -5849,6 +6161,7 @@ function bindAll() {
         });
     });
     [["ipe-ledger-prompt-name", LP], ["iped-ledger-prompt-name", LP],
+     ["ipe-ledger-prompt-n-name", LPN], ["iped-ledger-prompt-n-name", LPN],
      ["ipe-ledger-note-name", LN],   ["iped-ledger-note-name", LN]].forEach(function(pr){
         var el = q("#" + pr[0]); if (!el) return;
         el.addEventListener("input", function(){
@@ -5857,6 +6170,7 @@ function bindAll() {
         });
     });
     [["ipe-ledger-prompt-slot", LP], ["iped-ledger-prompt-slot", LP],
+     ["ipe-ledger-prompt-n-slot", LPN], ["iped-ledger-prompt-n-slot", LPN],
      ["ipe-ledger-note-slot", LN],   ["iped-ledger-note-slot", LN]].forEach(function(pr){
         var el = q("#" + pr[0]); if (!el) return;
         el.addEventListener("change", function(){
@@ -5865,6 +6179,7 @@ function bindAll() {
         });
     });
     [["ipe-ledger-prompt-add", LP, "lp"], ["iped-ledger-prompt-add", LP, "lp"],
+     ["ipe-ledger-prompt-n-add", LPN, "lpn"], ["iped-ledger-prompt-n-add", LPN, "lpn"],
      ["ipe-ledger-note-add", LN, "ln"],   ["iped-ledger-note-add", LN, "ln"]].forEach(function(pr){
         var el = q("#" + pr[0]); if (!el) return;
         el.addEventListener("click", function(){
@@ -5874,6 +6189,7 @@ function bindAll() {
         });
     });
     [["ipe-ledger-prompt-del", LP], ["iped-ledger-prompt-del", LP],
+     ["ipe-ledger-prompt-n-del", LPN], ["iped-ledger-prompt-n-del", LPN],
      ["ipe-ledger-note-del", LN],   ["iped-ledger-note-del", LN]].forEach(function(pr){
         var el = q("#" + pr[0]); if (!el) return;
         el.addEventListener("click", function(){
@@ -5944,6 +6260,7 @@ function bindAll() {
                 setTimeout(function(){
                     ipeLedgerSync();
                     ipeLedgerStatus("已切换到本聊天的账本", "#6ec577");
+                    try { ipeLedgerModeRefresh(); } catch(eS) {}   // 卡槽显示换成这张卡的
                     try { ipeImgRefreshLayerUI(); } catch(eL) {}   // 四个层框换成本聊天的
                 }, 200);
             });
@@ -6026,17 +6343,28 @@ function bindAll() {
 }
 
 function buildInjectTag(desc, layers) {
-    var tpl = ipeGetTemplateValue() || cfg().baseTemplate || "image###{Description}###";
+    var tpl = ipeGetTemplateValue() || cfg().baseTemplate || IPE_DEFAULT_IMAGE_TEMPLATE;
     desc = String(desc == null ? "" : desc);
-    if (layers) {
-        var used = {}, any = false;
-        IPE_IMG_LAYERS.forEach(function(l){
-            var ph = IPE_IMG_LAYER_PH[l];
-            if (tpl.indexOf(ph) >= 0) { tpl = tpl.split(ph).join(String(layers[l] || "").trim()); used[l] = true; any = true; }
-        });
-        if (any) desc = ipeImgJoinLayers(layers, used);   // {Description} 只拿没被单独放置的层
+    var vals = {}, any = false;
+    var hasDesc = tpl.indexOf("{Description}") >= 0;
+    IPE_IMG_LAYERS.forEach(function(l){
+        var ph = IPE_IMG_LAYER_PH[l];
+        if (tpl.indexOf(ph) < 0) return;
+        any = true;
+        // 有分层结果就各填各的；没分层结果时层占位符填空，由 ipeImgFillTemplate 把那几行连标签一起收掉
+        vals[ph] = layers ? String(layers[l] || "").trim() : "";
+    });
+    if (layers && any) {
+        var used = {};
+        IPE_IMG_LAYERS.forEach(function(l){ if (tpl.indexOf(IPE_IMG_LAYER_PH[l]) >= 0) used[l] = true; });
+        desc = ipeImgJoinLayers(layers, used);   // {Description} 只拿没被单独放置的层
     }
-    return tpl.indexOf("{Description}") >= 0 ? tpl.replace("{Description}", desc) : tpl + desc;
+    if (hasDesc) { vals["{Description}"] = desc; return ipeImgFillTemplate(tpl, vals); }
+    if (layers || !any) return ipeImgFillTemplate(tpl, vals) + desc;   // 没有 {Description}：剩下的层（或整段）追加在尾巴
+    /* 只为分层写的模板（只有 {Camera}…{Pose}、没有 {Description}），这次却没有分层结果
+       （分层关着 / 副 AI 没分层）：整段填进占位符所在的那一片，不让 {Camera} 这种字面量漏进正文。 */
+    var phs = ipeImgTemplatePlaceholders(tpl);
+    return tpl.slice(0, phs[0].i) + desc + tpl.slice(phs[phs.length - 1].e);
 }
 
 function injectDescToMessage(desc, targetIdx) {

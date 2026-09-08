@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const { JSDOM } = require("jsdom");
 
-const SRC = fs.readFileSync(path.join(__dirname, "../ipe-image-prompt-extractor-main/index.js"), "utf8");
+const SRC = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 
 let pass = 0, fail = 0;
 function ok(cond, name, extra) {
@@ -37,6 +37,7 @@ function makeTavern(floors) {
             MESSAGE_DELETED: "MESSAGE_DELETED", CHAT_CHANGED: "CHAT_CHANGED"
         },
         chatMetadata: {},
+        characters: [{ name: "苑无忧", avatar: "yuan.png" }, { name: "顾寒", avatar: "gu.png" }], characterId: 0, groupId: null, name2: "苑无忧",
         getCurrentChatId() { return "test-chat"; },
         setExtensionPrompt(key, value, pos, depth, scan, role) {
             extensionPrompts[key] = { value, position: pos, depth, role };
@@ -63,7 +64,9 @@ function boot(floors) {
         "ipeLedgerRun", "ipeLedgerCallAPI", "ipeLedgerReadStream", "ipeLedgerIsReasoningModel",
         "runExtract", "ipeImgParseLayers", "buildInjectTag", "buildVisionUserPrompt", "ipeImgLayersRead", "onRerollLayer",
         "ipeInstallZoomButtons", "ipeZoomOpen", "ipeZoomClose", "ipeZoomTitleFor",
-        "ipeImgPackBuild", "ipeImgPackImportText", "ipeGetBaseTemplates", "ipeGetRulePresets", "ipeGetSystemPromptPresets", "ipeGetAnchorPresets", "ipeGetAnchorUsageGuide"];
+        "ipeImgPackBuild", "ipeImgPackImportText", "ipeGetBaseTemplates", "ipeGetRulePresets", "ipeGetSystemPromptPresets", "ipeGetAnchorPresets", "ipeGetAnchorUsageGuide",
+        "ipeLedgerReadModeMarker", "ipeLedgerStripModeTag", "ipeLedgerModeEffective", "ipeLedgerModeState", "ipeLedgerModeSnippet", "ipeLedgerSystemText",
+        "ipeLedgerCardKey", "ipeLedgerCardSlotSet", "ipeLedgerPromptValueForMode", "ipeLedgerModeRefresh"];
     const shim = SRC + "\n;(function(){ " +
         exposed.map(n => `try{ window.__t_${n} = ${n}; }catch(e){}`).join(" ") +
         " try{ window.__t_failStreak = function(){ return ipeLedgerFailStreak; }; }catch(e){}" +
@@ -197,12 +200,25 @@ console.log("\n\u30109\u3011 \u8D34\u8033\u81EA\u68C0\u7EDD\u4E0D\u80FD\u6C61\u6
 }
 
 
-console.log("\n\u301010\u3011 生图 tag 剥离（2.9.2）");
+console.log("\n\u301010\u3011 生图 tag 剥离（2.9.2 / 2.14.0 内置改 <draw>）");
 {
     const { tavern, F } = boot(10);
     const strip = F("ipeLedgerStripImageTag");
-    eq(strip("正文。\n\nimage###a girl###"), "正文。", "默认模板 前后缀都有：整段剥掉");
+    eq(strip("正文。\n\n<draw>a girl by the window</draw>"), "正文。", "内置默认 <draw>…</draw>：整段剥掉");
+    eq(strip("正文。\n\n<draw>\nline one\nline two\n</draw>"), "正文。", "跨行的 <draw> 块也剥");
+    eq(strip("正文。\n\nimage###a girl###"), "正文。", "老聊天里的 image###…### 仍认得（legacy 兜底）");
     eq(strip("正文里提到 image###x### 这种写法。\n\nimage###real###"), "正文里提到 这种写法。", "前后缀齐全时按对剥（与旧行为一致）");
+    // 样板那种：整段 <draw> 包着、只放五个分层占位符、没有 {Description}
+    const STYLE = "<draw> Artistic Illustrations. Medium and style (hard rules): a refined 2.5D illustration.\n\nComposition: {Camera}\nSetting: {Env}\nMood and light: {Mood}\nCharacters: {Chars}\nAction: {Pose}\n </draw>";
+    const st10 = tavern.extensionSettings[F("EXT_NAME")];
+    st10.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "水光", value: STYLE }]);
+    st10.activeBaseTemplate = "tpl_1";
+    const tag10 = F("buildInjectTag")("ignored", { camera: "wide shot.", env: "a sunlit room.", mood: "caustic light.", chars: "a boy.", pose: "he sits." });
+    ok(tag10.indexOf("Composition: wide shot.") >= 0 && tag10.indexOf("Action: he sits.") >= 0 && tag10.indexOf("{") < 0, "样板模板：五层各就各位，没有占位符残留");
+    eq(strip("正文。\n\n" + tag10), "正文。", "样板模板注入的整块 <draw> 剥干净（之前没有 {Description} 的模板整段找不到，几千字风格正文会喂进挂账）");
+    eq(strip("正文。\n\n<draw> old style text. Composition: X\n </draw>"), "正文。", "模板正文后来改过：旧楼按 <draw> 标签对照样剥");
+    st10.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "非包裹分层", value: "IMG[ {Camera} | {Pose} ]END" }]);
+    eq(strip("正文。\n\nIMG[ a | b ]END"), "正文。", "不是标签包裹的分层模板：前缀取第一个占位符前、后缀取最后一个占位符后");
     tavern.extensionSettings["image-prompt-extractor"].baseTemplatesJson = JSON.stringify([
         { id: "tpl_1", name: "前缀", value: "IMG: {Description}" },
         { id: "tpl_2", name: "无占位", value: "[pic]" }]);
@@ -502,11 +518,36 @@ await (async () => {
     ok(c.indexOf("<camera>A.</camera>") >= 0 && c.indexOf("<pose>") >= 0 && c.indexOf("<pose>D.</pose>") < 0, "请求里锁了三层，没锁动作层");
 })();
 
-console.log("\n【26】 模板占位符：{Env} {Pose} 单放，{Description} 拿剩下的；老模板照旧");
+console.log("\n【23b】 NO_CHANGE 带句号 / 引号 / 空格也算哨兵；老存档里的 NO_CHANGE. 不再往下传（2.14.2）");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const cap = {};
+    const st = imgApi(w, tavern, F, () => L4("wide.", "a rooftop at dusk.", "a girl.", "she leans.", "warm light."), cap);
+    st.imgLayered = true;
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    imgApi(w, tavern, F, () => L4("close-up.", "NO_CHANGE.", "the girl.", "she turns.", "`No change`"), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    eq(box(w, "ipe-layer-env"), "a rooftop at dusk.", "NO_CHANGE. 带句号 → 沿用上一楼环境，不落哨兵字面量");
+    eq(box(w, "ipe-layer-mood"), "warm light.", "`No change` 反引号 + 空格 → 沿用上一楼氛围");
+    ok(box(w, "ipe-preview-text").indexOf("NO_CHANGE") < 0, "拼好的整段里没有 NO_CHANGE");
+    ok(imgStatus(w).indexOf("环境沿用第 10 楼") >= 0 && imgStatus(w).indexOf("氛围沿用第 10 楼") >= 0, "状态行报沿用而不是「五层齐全」", imgStatus(w));
+    // 老版本存进 chat_metadata 的哨兵字面量：不喂给副 AI，也不当作上一楼内容沿用
+    const saved = F("ipeImgLayersRead")();
+    ok(!!saved, "存档读得到"); saved.env = "NO_CHANGE.";
+    imgApi(w, tavern, F, () => L4("close-up.", "NO_CHANGE", "the girl.", "she turns.", "NO_CHANGE"), cap);
+    await F("runExtract")(tavern.chat[9].mes, "", false, 9);
+    ok(cap.body.messages[1].content.indexOf("上一楼的环境层】\nNO_CHANGE") < 0, "存档里的 NO_CHANGE. 没被当成上一楼环境喂给副 AI");
+    eq(box(w, "ipe-layer-env"), "", "没有真环境可沿用时环境框为空，而不是 NO_CHANGE.");
+    ok(imgStatus(w).indexOf("环境层为空") >= 0, "状态行如实报环境层为空", imgStatus(w));
+})();
+
+console.log("\n【26】 模板占位符：{Env} {Pose} 单放，{Description} 拿剩下的；老模板照旧；内置默认 <draw>");
 {
-    const { tavern, F } = boot(4);
+    const { w, tavern, F } = boot(4);
     const st = tavern.extensionSettings[F("EXT_NAME")];
     const layers = { camera: "CAM", env: "ENV", chars: "CHR", pose: "POS" };
+    eq(F("buildInjectTag")("plain", null), "<draw>plain</draw>", "模板留空：内置默认 <draw>{Description}</draw>");
+    eq(F("buildInjectTag")("CAM ENV CHR POS", layers), "<draw>CAM ENV CHR POS</draw>", "内置默认 + 分层：整段进 {Description}");
     st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "分层", value: "scene: {Env} | action: {Pose} | rest: {Description}" }]);
     st.activeBaseTemplate = "tpl_1";
     eq(F("buildInjectTag")("ignored", layers), "scene: ENV | action: POS | rest: CAM CHR", "层占位符各就各位，{Description} 只拿没放的层");
@@ -515,6 +556,36 @@ console.log("\n【26】 模板占位符：{Env} {Pose} 单放，{Description} �
     eq(F("buildInjectTag")("plain", null), "image###plain###", "非分层模式完全不受影响");
     st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "全层", value: "{Camera}/{Env}/{Chars}/{Pose}" }]);
     eq(F("buildInjectTag")("whatever", layers), "CAM/ENV/CHR/POS", "四层全单放、没有 {Description} 也不多拼");
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "只为分层", value: "<draw>S. Composition: {Camera}\nAction: {Pose}\n</draw>" }]);
+    eq(F("buildInjectTag")("flat desc", null), "<draw>S. Composition: flat desc\n</draw>", "只放层占位符的模板碰上没分层：整段填进占位符那一片，{Camera} 不漏进正文");
+    const d26 = w.document;
+    d26.querySelector("#ipe-template-add").click();
+    const added = F("ipeGetBaseTemplates")();
+    eq(added[added.length - 1].value, "<draw>{Description}</draw>", "「新增模板」初值是 <draw>{Description}</draw>");
+}
+
+console.log("\n【26b】 模板融合（2.14.1）：分层与整段共用一张模板，占位符全空的行整行收掉");
+{
+    const { tavern, F } = boot(4);
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    const strip = F("ipeLedgerStripImageTag");
+    const BOTH = "<draw> style text.\nComposition: {Camera}\nSetting: {Env}\nMood and light: {Mood}\nCharacters: {Chars}\nAction: {Pose}\n{Description}\n </draw>";
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "融合", value: BOTH }]);
+    st.activeBaseTemplate = "tpl_1";
+    const five = { camera: "C.", env: "E.", mood: "M.", chars: "CH.", pose: "P." };
+    eq(F("buildInjectTag")("ignored", five), "<draw> style text.\nComposition: C.\nSetting: E.\nMood and light: M.\nCharacters: CH.\nAction: P.\n </draw>", "分层成功：五行各就各位，{Description} 那行消失，没有空行");
+    eq(F("buildInjectTag")("one flat english description.", null), "<draw> style text.\none flat english description.\n </draw>", "没分层：五行连 Setting: 这些标签一起消失，整段落在 {Description} 那行");
+    eq(F("buildInjectTag")("ignored", { camera: "C.", env: "", mood: "", chars: "CH.", pose: "P." }), "<draw> style text.\nComposition: C.\nCharacters: CH.\nAction: P.\n </draw>", "某一层空了：只收那一行");
+    eq(F("buildInjectTag")("ignored", { camera: "C.", chars: "CH.", pose: "P." }), "<draw> style text.\nComposition: C.\nCharacters: CH.\nAction: P.\n </draw>", "层对象里干脆没这层：同样只收那一行");
+    eq(F("buildInjectTag")("price $& and $1", null), "<draw> style text.\nprice $& and $1\n </draw>", "desc 里的 $& 不被 replace 当模式吃掉");
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "单行", value: "{Camera} | {Env} | {Description}" }]);
+    eq(F("buildInjectTag")("flat", null), " |  | flat", "单行模板不收行（没有行可收），层占位符填空");
+    eq(F("buildInjectTag")("x", { camera: "C", env: "E" }), "C | E | ", "单行分层：各填各的");
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_1", name: "非包裹多行", value: "IMG START\nComposition: {Camera}\nDesc: {Description}\nIMG END" }]);
+    const flatTag = F("buildInjectTag")("flat", null);
+    eq(flatTag, "IMG START\nDesc: flat\nIMG END", "非包裹多行：Composition 行收掉");
+    eq(strip("正文。\n\n" + flatTag), "正文。", "收了行之后挂账照样剥得掉（前缀退到占位符所在行之前）");
+    eq(strip("正文。\n\n" + F("buildInjectTag")("x", { camera: "C" })), "正文。", "分层注入的同样剥得掉");
 }
 
 console.log("\n【27】 副 AI 没分层：整段兜底，层框不动，状态行明示；分层关着时合同不发");
@@ -575,7 +646,7 @@ await (async () => {
     eq(ov.style.position, "fixed", "弹窗定位内联，不依赖外部 CSS");
     ok(ov.style.zIndex === "2147483647" && ov.style.getPropertyPriority("z-index") === "important" && ov.style.display === "flex", "z-index 最大值且 important，压得住被强制到 2147483646 的面板");
     ok(/px$/.test(ov.style.height) && parseInt(ov.style.height, 10) === w.innerHeight, "jsdom 里 rect 为 0 → 触发像素兜底，高度=视口高");
-    ok(d.querySelector("#ipe-panel .ipe-footer").textContent.indexOf("v2.12.12") >= 0, "面板底栏带版本号");
+    ok(d.querySelector("#ipe-panel .ipe-footer").textContent.indexOf("v2.14.3") >= 0, "面板底栏带版本号");
     eq(src.parentNode.querySelector(".ipe-zoom-btn").style.position, "absolute", "按钮定位内联");
     const big = ov.querySelector(".ipe-zoom-ta");
     big.value = "he leans on the door frame.";
@@ -780,6 +851,111 @@ await (async () => {
     ok(card.style.fontSize === "11.5px" && card.style.borderRadius === "10px", "卡片字号 11.5、圆角 10");
     const st = d.getElementById("ipe-notice-stack");
     ok(st.style.width.indexOf("280px") >= 0, "桌面栈宽 280", st.style.width);
+})();
+
+console.log("\n【35】 两个槽：Normal 槽 / NSFW 槽各自的库，楼尾标记二选一；没标记沿用；锁定优先；关着不动；标记不喂副 AI");
+await (async () => {
+    const { w, tavern, F } = boot(12);
+    const st = withApi(tavern, F, "gpt-4.1");
+    st.ledgerPromptPresetsJson = JSON.stringify([{ id: "lp_1", name: "日常烟火", value: "RULE-DAILY" }, { id: "lp_2", name: "大剧情", value: "RULE-EPIC" }]);
+    st.activeLedgerPrompt = "lp_1";
+    st.ledgerPromptNsfwPresetsJson = JSON.stringify([{ id: "lpn_1", name: "现代NSFW", value: "RULE-MODERN-N" }, { id: "lpn_2", name: "古代NSFW", value: "RULE-ANCIENT-N" }]);
+    st.activeLedgerPromptNsfw = "lpn_2";
+    const P = F("ipeLedgerReadModeMarker"), S = F("ipeLedgerStripModeTag");
+    eq(P("正文……\n<route>nsfw</route>"), "nsfw", "默认读取与枢轨相同的 route 标记");
+    eq(P("正文……\n<IPE_MODE> NSFW </IPE_MODE>"), "nsfw", "兼容旧 ipe_mode，大小写不敏感");
+    eq(P("正文引用 <route>nsfw</route> 作为例子，后面还有正文。"), "", "正文中引用标签不误切，只认楼尾");
+    eq(S("正文。\n<route>nsfw</route>"), "正文。", "剥掉楼尾标记");
+    let cap = {};
+    const okStream = () => ({ ok: true, status: 200, body: sseBody(['data: {"choices":[{"delta":{"content":"<ledger>账本内容够长够长够长够长够长够长够长。</ledger>"}}]}\n']) });
+    w.fetch = async (u, o) => { cap.body = JSON.parse(o.body); return okStream(); };
+    tavern.chat[9].mes = "第10层正文。\n<route>nsfw</route>";
+    await F("ipeLedgerRun")(9, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-DAILY") === 0, "场景模式关着：一直用 Normal 槽");
+    st.ledgerModeEnabled = true;
+    await F("ipeLedgerRun")(9, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-ANCIENT-N") === 0, "读到 nsfw → 用 NSFW 槽选中的古代NSFW", cap.body.messages[0].content.slice(0, 30));
+    ok(cap.body.messages[1].content.indexOf("<route>") < 0, "标记不喂给副 AI");
+    eq(F("ipeLedgerModeState")().mode, "nsfw", "状态记在本聊天");
+    st.activeLedgerPromptNsfw = "lpn_1";
+    tavern.chat[11].mes = "第12层正文，没写标记，够长够长够长。";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-MODERN-N") === 0, "没标记沿用 nsfw；NSFW 槽换选现代NSFW就用现代");
+    tavern.chat[11].mes = "第12层结束。\n<route>normal</route>";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-DAILY") === 0, "normal → 回 Normal 槽");
+    st.activeLedgerPrompt = "lp_2";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-EPIC") === 0, "Normal 槽换选大剧情就用大剧情");
+    tavern.chat[11].mes = "第12层。\n<route>whatever</route>";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-EPIC") === 0, "不认识的模式名不认，状态不变");
+    st.ledgerModeManual = "nsfw";
+    tavern.chat[11].mes = "第12层。\n<route>normal</route>";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-MODERN-N") === 0, "锁定 nsfw 时，标记写 normal 也不听");
+    st.ledgerModeManual = "";
+    // NSFW 槽选了个空预设 → 回落到 Normal，状态行提示
+    st.ledgerPromptNsfwPresetsJson = JSON.stringify([{ id: "lpn_1", name: "空的", value: "" }]); st.activeLedgerPromptNsfw = "lpn_1";
+    tavern.chat[11].mes = "第12层。\n<route>nsfw</route>";
+    await F("ipeLedgerRun")(11, true);
+    ok(cap.body.messages[0].content.indexOf("RULE-EPIC") === 0, "NSFW 槽内容为空 → 回落 Normal 槽");
+    ok(w.document.querySelector("#ipe-ledger-status").textContent.indexOf("内容为空") >= 0, "状态行说明回落", w.document.querySelector("#ipe-ledger-status").textContent);
+    ok(F("ipeLedgerModeSnippet")().indexOf("<route>normal</route>") >= 0 && F("ipeLedgerModeSnippet")().indexOf("<route>nsfw</route>") >= 0 && F("ipeLedgerModeSnippet")().indexOf("aftercare") < 0, "给主 AI 的话只有 normal / nsfw");
+})();
+
+console.log("\n【35b】 名字框改名（2.14.3）：正在打字的框不被回写，清空不弹兜底名，输入法合成不被打断；离开框才补兜底名");
+await (async () => {
+    const { w, tavern, F } = boot(4);
+    const d = w.document;
+    const type = (el, v) => { el.value = v; el.dispatchEvent(new w.Event("input", { bubbles: true })); };
+    const cases = [
+        ["ipe-template-name", "ipe-template-slot", () => F("ipeGetBaseTemplates")()],
+        ["ipe-anchor-name",   "ipe-anchor-slot",   () => F("ipeGetAnchorPresets")()],
+        ["ipe-rule-name",     "ipe-rule-slot",     () => F("ipeGetRulePresets")()],
+    ];
+    for (const [nameId, slotId, list] of cases) {
+        const el = d.querySelector("#" + nameId); ok(!!el, nameId + " 存在"); if (!el) continue;
+        el.focus(); eq(d.activeElement, el, nameId + " 拿到焦点");
+        type(el, "");
+        eq(el.value, "", nameId + "：清空的瞬间不被写回兜底名");
+        type(el, "ni h");                       // 输入法合成中的拼音
+        eq(el.value, "ni h", nameId + "：合成中的拼音原样留在框里");
+        type(el, "你好");                        // 选中候选词
+        eq(el.value, "你好", nameId + "：选词后就是「你好」，不是「模板N你好」");
+        el.dispatchEvent(new w.Event("change", { bubbles: true }));
+        eq(el.value, "你好", nameId + "：离开框后名字还是「你好」");
+        const sel = d.querySelector("#" + slotId);
+        eq(sel && sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].textContent, "你好", nameId + "：下拉里的名字同步成「你好」");
+        ok(list().some(x => x.name === "你好"), nameId + "：存进预设库的也是「你好」");
+        type(el, ""); el.dispatchEvent(new w.Event("change", { bubbles: true }));
+        ok(el.value !== "", nameId + "：清空后离开框，兜底名才写回来（" + el.value + "）");
+        el.blur();
+    }
+})();
+
+console.log("\n【36】 NSFW 槽面板：开了场景模式才出现；有自己的下拉 / 名称 / 新增 / 删除 / 文本框；改文字只动 NSFW 库");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    const d = w.document;
+    F("ipeLedgerModeRefresh")();
+    const fold = d.querySelector("#ipe-ledger-nsfw-fold");
+    ok(!!fold && fold.style.display === "none", "关着：NSFW 槽面板藏起来");
+    st.ledgerModeEnabled = true; F("ipeLedgerModeRefresh")();
+    ok(fold.style.display !== "none", "开了：NSFW 槽面板出现");
+    ok(!!d.querySelector("#ipe-ledger-prompt-n-slot") && !!d.querySelector("#ipe-ledger-prompt-n-name") && !!d.querySelector("#ipe-ledger-prompt-n-add") && !!d.querySelector("#ipe-ledger-prompt-n-del") && !!d.querySelector("#ipe-ledger-prompt-n"), "版面和 Normal 槽一样：下拉 / 名称 / 新增 / 删除 / 文本框");
+    ok(!d.querySelector("#ipe-ledger-mode-rows") && !d.querySelector("#ipe-ledger-slots") && !d.querySelector("#ipe-ledger-mode-add"), "旧的模式行 / 卡槽区 / 新增模式都没了");
+    const ta = d.querySelector("#ipe-ledger-prompt-n");
+    ta.value = "NSFW 规则文字"; ta.dispatchEvent(new w.Event("input", { bubbles: true }));
+    const nl = JSON.parse(st.ledgerPromptNsfwPresetsJson); const npv = JSON.parse(st.ledgerPromptPresetsJson || "[]");
+    ok(nl.length === 1 && nl[0].value === "NSFW 规则文字", "文字写进 NSFW 库");
+    ok(!npv.some(x => x.value === "NSFW 规则文字"), "Normal 库没被动");
+    d.querySelector("#ipe-ledger-prompt-n-add").click();
+    eq(JSON.parse(st.ledgerPromptNsfwPresetsJson).length, 2, "NSFW 槽「新增」多一套，只在 NSFW 库里");
+    const man = d.querySelector("#ipe-ledger-mode-manual");
+    ok(man && man.options.length === 3, "手动锁定只有 自动 / normal / nsfw 三档");
+    ok(d.querySelector("#ipe-ledger-mode-now").textContent.indexOf("Normal 槽 →") >= 0 && d.querySelector("#ipe-ledger-mode-now").textContent.indexOf("NSFW 槽 →") >= 0, "状态行同时报两个槽各选了什么");
 })();
 
 console.log("\n" + "\u2500".repeat(46));
