@@ -62,7 +62,7 @@ function boot(floors) {
         "ipeLedgerIsAbort", "ipeLedgerExport", "ipeLedgerImportText", "ipeLedgerInspectEP",
         "EXT_NAME", "DEFAULTS", "IPE_LEDGER_EP_KEY", "init", "ipeLedgerStripImageTag", "ipeLedgerBuildUser", "ipeLedgerReportBlock", "ipeLedgerPruneMirror",
         "ipeLedgerRun", "ipeLedgerCallAPI", "ipeLedgerReadStream", "ipeLedgerIsReasoningModel",
-        "runExtract", "ipeImgParseLayers", "buildInjectTag", "buildVisionUserPrompt", "ipeImgLayersRead", "onRerollLayer",
+        "runExtract", "ipeImgParseLayers", "buildInjectTag", "reinjectDescToMessage", "injectDescToMessage", "ipeInstallMesButtons", "ipeGetSuppPresets", "ipeRefreshSuppPresets", "buildVisionUserPrompt", "ipeImgLayersRead", "onRerollLayer",
         "ipeInstallZoomButtons", "ipeZoomOpen", "ipeZoomClose", "ipeZoomTitleFor",
         "ipeImgPackBuild", "ipeImgPackImportText", "ipeGetBaseTemplates", "ipeGetRulePresets", "ipeGetSystemPromptPresets", "ipeGetAnchorPresets", "ipeGetAnchorUsageGuide",
         "ipeLedgerReadModeMarker", "ipeLedgerStripModeTag", "ipeLedgerModeEffective", "ipeLedgerModeState", "ipeLedgerModeSnippet", "ipeLedgerSystemText",
@@ -646,7 +646,7 @@ await (async () => {
     eq(ov.style.position, "fixed", "弹窗定位内联，不依赖外部 CSS");
     ok(ov.style.zIndex === "2147483647" && ov.style.getPropertyPriority("z-index") === "important" && ov.style.display === "flex", "z-index 最大值且 important，压得住被强制到 2147483646 的面板");
     ok(/px$/.test(ov.style.height) && parseInt(ov.style.height, 10) === w.innerHeight, "jsdom 里 rect 为 0 → 触发像素兜底，高度=视口高");
-    ok(d.querySelector("#ipe-panel .ipe-footer").textContent.indexOf("v2.14.3") >= 0, "面板底栏带版本号");
+    ok(d.querySelector("#ipe-panel .ipe-footer").textContent.indexOf("v2.16.1") >= 0, "面板底栏带版本号");
     eq(src.parentNode.querySelector(".ipe-zoom-btn").style.position, "absolute", "按钮定位内联");
     const big = ov.querySelector(".ipe-zoom-ta");
     big.value = "he leans on the door frame.";
@@ -932,6 +932,149 @@ await (async () => {
         ok(el.value !== "", nameId + "：清空后离开框，兜底名才写回来（" + el.value + "）");
         el.blur();
     }
+})();
+
+console.log("\n【37】 换画风重注入（2.15.0）：不重提，剥掉楼尾旧块按当前模板重拼；面板 / 抽屉按钮；快捷下拉与模板预设同步");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const d = w.document;
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    st.baseTemplatesJson = JSON.stringify([
+        { id: "tpl_a", name: "水墨", value: "<draw>INK: {Description}</draw>" },
+        { id: "tpl_b", name: "动漫", value: "ANIME[ {Description} ]END" }]);
+    st.activeBaseTemplate = "tpl_a";
+    F("ipeGetBaseTemplates")();
+    d.querySelector("#ipe-template-slot").dispatchEvent(new w.Event("change", { bubbles: true }));   // 触发一次刷新，把下拉填好
+    tavern.chat[9].mes = "正文。\n\n<draw>old desc</draw>";
+    d.querySelector("#ipe-preview-text").value = "new desc";
+    let saved = 0; tavern.saveChat = () => { saved++; };
+    let rerendered = 0; tavern.updateMessageBlock = () => { rerendered++; }; tavern.messageFormatting = () => { rerendered++; return ""; };
+    // 楼里的 DOM：一张别的扩展渲染出来的前端卡 + 上次注入追加的 <p>
+    d.body.insertAdjacentHTML("beforeend", '<div id="chat"><div class="mes" mesid="9"><div class="mes_text"><div class="card"><iframe></iframe>状态栏</div><p>&lt;draw&gt;old desc&lt;/draw&gt;</p></div></div></div>');
+    const mesText = d.querySelector('#chat .mes[mesid="9"] .mes_text');
+    let r = F("reinjectDescToMessage")(9);
+    eq(rerendered, 0, "不走 updateMessageBlock / messageFormatting 整楼重排（2.15.1：重排会让前端卡变成一屏源码）");
+    ok(!!mesText.querySelector(".card iframe"), "别的扩展渲染的前端卡原样留着");
+    eq(mesText.querySelectorAll("p").length, 1, "旧的注入 <p> 摘掉，只剩新的一段");
+    eq(mesText.querySelector("p").textContent, "<draw>INK: new desc</draw>", "新 <p> 是水墨模板拼的那块");
+    eq(tavern.chat[9].mes, "正文。\n\n<draw>INK: new desc</draw>", "旧 <draw> 块剥掉，按水墨模板重拼");
+    ok(r.injected && r.replaced, "报告：已注入且替换了旧块"); eq(saved, 1, "存了聊天");
+    // 换画风：快捷下拉选动漫 → 模板预设同步 → 点按钮
+    const quick = d.querySelector("#ipe-reinject-tpl"); ok(!!quick && quick.options.length === 2, "预览区有快捷模板下拉，两个模板都在");
+    quick.value = "tpl_b"; quick.dispatchEvent(new w.Event("change", { bubbles: true }));
+    eq(st.activeBaseTemplate, "tpl_b", "快捷下拉选了就是切换基础模板");
+    eq(d.querySelector("#ipe-template-slot").value, "tpl_b", "基础模板区的下拉同步");
+    d.querySelector("#ipe-btn-reinject").click();
+    eq(tavern.chat[9].mes, "正文。\n\nANIME[ new desc ]END", "按钮：currentIdx 没定位时落到最后一条 AI 楼，旧 <draw> 没了、只有动漫块，不重复");
+    eq(mesText.querySelectorAll("p").length, 1, "DOM 里也只有一段"); eq(mesText.querySelector("p").textContent, "ANIME[ new desc ]END", "DOM 里那段换成了动漫块（按 extra 记录的原文认旧段）");
+    ok(!!mesText.querySelector(".card iframe") && rerendered === 0, "前端卡还在，仍没整楼重排");
+    ok(imgStatus(w).indexOf("已按「动漫」重新注入第 10 楼") >= 0, "状态行报模板名和楼号", imgStatus(w));
+    d.querySelector("#ipe-btn-reinject").click();
+    eq(tavern.chat[9].mes, "正文。\n\nANIME[ new desc ]END", "再点一次：内容一样不重复追加");
+    ok(imgStatus(w).indexOf("没变") >= 0, "状态行说没变", imgStatus(w));
+    // 老版本 image### 楼也能换
+    tavern.chat[9].mes = "正文。\n\nimage###legacy###";
+    F("reinjectDescToMessage")(9);
+    eq(tavern.chat[9].mes, "正文。\n\nANIME[ new desc ]END", "老楼里的 image###…### 一样被换掉");
+    // swipes 同步
+    tavern.chat[9].swipes = ["x"]; tavern.chat[9].swipe_id = 0; tavern.chat[9].mes = "正文。";
+    F("reinjectDescToMessage")(9);
+    eq(tavern.chat[9].swipes[0], tavern.chat[9].mes, "swipes[swipe_id] 同步");
+    // 分层：层框是这楼存下来的 → 用层框填层占位符
+    st.imgLayered = true;
+    st.baseTemplatesJson = JSON.stringify([{ id: "tpl_c", name: "分层", value: "<draw>C={Camera}\nP={Pose}\n{Description}\n</draw>" }]);
+    st.activeBaseTemplate = "tpl_c";
+    d.querySelector("#ipe-preview-text").value = "";
+    tavern.chatMetadata.ipe_img_layers_v1 = { floor: 10, camera: "cam.", env: "", mood: "", chars: "", pose: "pose." };
+    d.querySelector("#ipe-layer-camera").value = "cam."; d.querySelector("#ipe-layer-pose").value = "pose.";
+    tavern.chat[9].mes = "正文。\n\nANIME[ new desc ]END";
+    F("reinjectDescToMessage")(9);
+    eq(tavern.chat[9].mes, "正文。\n\n<draw>C=cam.\nP=pose.\n</draw>", "预览空但层框是这楼的：按层框重拼，{Description} 行收掉；动漫模板已被删也照样剥掉旧块（靠 extra 里的记录）");
+    eq(tavern.chat[9].extra && tavern.chat[9].extra.ipe_inject_tag, "<draw>C=cam.\nP=pose.\n</draw>", "这楼 extra 里记着本次注入的那块");
+    // 什么都没有 → 直说
+    tavern.chatMetadata.ipe_img_layers_v1.floor = 3;
+    delete tavern.chat[9].extra.ipe_inject_desc;   // 这楼的记录也抹掉，才是真的什么都没有
+    let threw = ""; try { F("reinjectDescToMessage")(9); } catch(e) { threw = e.message; }
+    ok(threw.indexOf("先提取一次") >= 0, "预览空、层框不是这楼的：报「先提取一次」", threw);
+})();
+
+console.log("\n【38】 每楼记提取结果 + 楼层 🎨 按钮（2.16.0）：翻到哪楼点哪楼，按记录重拼，不拿预览框里别楼的内容");
+await (async () => {
+    const { w, tavern, F } = boot(10);
+    const d = w.document;
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    st.baseTemplatesJson = JSON.stringify([
+        { id: "tpl_a", name: "水墨", value: "<draw>INK: {Description}</draw>" },
+        { id: "tpl_b", name: "动漫", value: "<draw>ANIME: {Camera} / {Description}</draw>" }]);
+    st.activeBaseTemplate = "tpl_a";
+    d.querySelector("#ipe-template-slot").dispatchEvent(new w.Event("change", { bubbles: true }));
+    tavern.saveChat = () => {};
+    // 第 8 楼（idx 7）用普通注入；第 10 楼（idx 9）用分层注入
+    tavern.chat[7].mes = "八楼正文。"; tavern.chat[9].mes = "十楼正文。";
+    d.querySelector("#ipe-preview-text").value = "floor eight desc";
+    F("injectDescToMessage")("floor eight desc", 7);
+    eq(tavern.chat[7].extra.ipe_inject_desc, "floor eight desc", "注入时把描述记进这楼的 extra");
+    eq(tavern.chat[7].extra.ipe_inject_layers, null, "非分层注入：层记录为 null");
+    tavern.chat[9].extra = { ipe_inject_tag: "<draw>INK: ten</draw>", ipe_inject_desc: "ten", ipe_inject_layers: { camera: "wide.", env: "", mood: "", chars: "", pose: "sits." } };
+    tavern.chat[9].mes = "十楼正文。\n\n<draw>INK: ten</draw>";
+    // 楼层按钮：只挂在有记录的 AI 楼
+    // 第 10 楼是酒馆标准结构（mes_buttons 里有折叠的 extraMesButtons 和「…」提示），第 8 楼只有 extraMesButtons
+    d.body.insertAdjacentHTML("beforeend", '<div id="chat">' + [5, 6, 7, 8].map(i => '<div class="mes" mesid="' + i + '" is_user="' + (tavern.chat[i].is_user ? "true" : "false") + '"><div class="extraMesButtons"><div class="mes_button other"></div></div><div class="mes_text"><p>x</p></div></div>').join("")
+        + '<div class="mes" mesid="9" is_user="false"><div class="mes_buttons"><div class="extraMesButtons" style="display:none"><div class="mes_button other"></div></div><div class="extraMesButtonsHint fa-solid fa-ellipsis"></div><div class="mes_edit fa-solid fa-pencil"></div></div><div class="mes_text"><p>x</p></div></div></div>');
+    F("ipeInstallMesButtons")();
+    const btn = i => d.querySelector('#chat .mes[mesid="' + i + '"] .ipe-mes-reinject');
+    ok(!!btn(7) && !!btn(9), "第 8、10 楼（有记录）有 🎨 按钮");
+    ok(btn(9).parentElement.classList.contains("mes_buttons") && btn(9).nextElementSibling && btn(9).nextElementSibling.classList.contains("extraMesButtonsHint"), "标准结构：🎨 放在「…」左边常驻可见，不塞进折叠的 extraMesButtons");
+    ok(!d.querySelector('#chat .mes[mesid="9"] .extraMesButtons .ipe-mes-reinject'), "第 10 楼的折叠区里没有重复的");
+    ok(!btn(5) && !btn(6) && !btn(8), "没记录的 AI 楼、user 楼都没有按钮");
+    F("ipeInstallMesButtons")();
+    eq(d.querySelectorAll('#chat .mes[mesid="9"] .ipe-mes-reinject').length, 1, "重复安装不重复加");
+    // 预览框里是别楼的内容；切到动漫模板后按第 8 楼的按钮 → 按第 8 楼自己的记录重拼
+    d.querySelector("#ipe-preview-text").value = "SOMETHING ELSE";
+    const quick = d.querySelector("#ipe-reinject-tpl"); quick.value = "tpl_b"; quick.dispatchEvent(new w.Event("change", { bubbles: true }));
+    let r = F("reinjectDescToMessage")(7, { preferRecord: true });
+    eq(tavern.chat[7].mes, "八楼正文。\n\n<draw>ANIME:  / floor eight desc</draw>", "第 8 楼按自己的记录重拼，没拿预览框里的别楼内容");
+    ok(r.injected && r.replaced, "旧块替换");
+    r = F("reinjectDescToMessage")(9, { preferRecord: true });
+    eq(tavern.chat[9].mes, "十楼正文。\n\n<draw>ANIME: wide. / sits.</draw>", "第 10 楼按记录的五层重拼：{Camera} 填镜头，{Description} 拿剩下的层");
+    eq(tavern.chat[9].extra.ipe_inject_tag, "<draw>ANIME: wide. / sits.</draw>", "重注入后记录的原文跟着更新");
+    eq(tavern.chat[9].extra.ipe_inject_desc, "ten", "描述和五层原样保留（拼装规则和当初注入时一致）");
+    // 面板按钮、不是刚提取那楼：也走记录，不拿预览框（先在第 10 楼提取一次，让 currentIdx 落在第 10 楼）
+    st.imgLayered = false; imgApi(w, tavern, F, () => "flat ten.", {});
+    d.querySelector("#ipe-btn-extract").click();                       // 手动提取：定位到最后一条 AI 楼（第 10 楼）
+    await new Promise(res => setTimeout(res, 80));
+    eq(d.querySelector("#ipe-preview-text").value, "flat ten.", "预览框现在是第 10 楼的");
+    r = F("reinjectDescToMessage")(7);
+    eq(tavern.chat[7].mes, "八楼正文。\n\n<draw>ANIME:  / floor eight desc</draw>", "面板按钮指到别楼：同样用那楼的记录");
+    // 没记录的楼
+    let threw = ""; try { F("reinjectDescToMessage")(5, { preferRecord: true }); } catch(e) { threw = e.message; }
+    ok(threw.indexOf("没有提取记录") >= 0, "没记录的楼报「没有提取记录」", threw);
+})();
+
+console.log("\n【39】 补充指令常用短语（2.16.0）：存 / 选填 / 追加 / 删，存进设置");
+await (async () => {
+    const { w, tavern, F } = boot(4);
+    const d = w.document;
+    const st = tavern.extensionSettings[F("EXT_NAME")];
+    const inp = d.querySelector("#ipe-supplement"), sel = d.querySelector("#ipe-supp-presets");
+    ok(!!sel && !!d.querySelector("#ipe-supp-save") && !!d.querySelector("#ipe-supp-del"), "面板里有下拉 / 存为常用 / 删");
+    d.querySelector("#ipe-supp-save").click();
+    eq(F("ipeGetSuppPresets")().length, 0, "空的不存");
+    inp.value = "这段是冷战不是撒娇"; d.querySelector("#ipe-supp-save").click();
+    inp.value = "只画一个人"; d.querySelector("#ipe-supp-save").click();
+    inp.value = "只画一个人"; d.querySelector("#ipe-supp-save").click();
+    eq(JSON.parse(st.supplementPresetsJson).length, 2, "存了两条，重复的不再存，落在设置里");
+    eq(sel.options.length, 3, "下拉 = 占位 + 两条");
+    inp.value = "";
+    sel.value = "0"; sel.dispatchEvent(new w.Event("change", { bubbles: true }));
+    eq(inp.value, "这段是冷战不是撒娇", "框空着：选一条直接填进去");
+    sel.value = "1"; sel.dispatchEvent(new w.Event("change", { bubbles: true }));
+    eq(inp.value, "这段是冷战不是撒娇；只画一个人", "框里有字：用分号追加");
+    sel.dispatchEvent(new w.Event("change", { bubbles: true }));
+    eq(inp.value, "这段是冷战不是撒娇；只画一个人", "已经有的不重复追加");
+    sel.value = "0"; d.querySelector("#ipe-supp-del").click();
+    eq(F("ipeGetSuppPresets")().join("|"), "只画一个人", "删掉选中的那条");
+    eq(sel.options.length, 2, "下拉同步少一条");
 })();
 
 console.log("\n【36】 NSFW 槽面板：开了场景模式才出现；有自己的下拉 / 名称 / 新增 / 删除 / 文本框；改文字只动 NSFW 库");

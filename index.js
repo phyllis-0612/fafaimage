@@ -4,7 +4,7 @@
  */
 
 const EXT_NAME = "image-prompt-extractor";
-var IPE_VERSION = "2.14.3";
+var IPE_VERSION = "2.16.1";
 /* 内置生图包裹（2.14.0）：默认模板、新建模板的初值、挂账剥标签的兜底，都认这一个。
    之前是 image###…###；老聊天里已经注入过的 image### 楼仍按 IPE_LEGACY_IMAGE_TEMPLATE 剥，不留脏正文。 */
 var IPE_DEFAULT_IMAGE_TEMPLATE = "<draw>{Description}</draw>";
@@ -50,6 +50,7 @@ const DEFAULTS = {
     mistTheme: false,   // v1.8.7 开灯：莫兰迪雾蓝浅色皮，默认关（暗色）
     autoInject: false,
     autoInjectDelay: 1800,
+    supplementPresetsJson: "[]",   // 2.16.0 补充指令常用短语
     requestTimeout: 0,
     apiEndpoint: "", apiKey: "", model: "",
     apiProfilesJson: "", activeApiProfile: "api_1",
@@ -3147,6 +3148,8 @@ function ipeRefreshTemplateEditors() {
 
     ipeFillSelect("ipe-template-slot", list, active);
     ipeFillSelect("iped-template-slot", list, active);
+    ipeFillSelect("ipe-reinject-tpl", list, active);     // 预览区的快捷下拉，与模板预设同一份
+    ipeFillSelect("iped-reinject-tpl", list, active);
 
     ["ipe-template-name","iped-template-name"].forEach(function(id){
         var el = q("#" + id); if (el && el !== document.activeElement) el.value = item.name || "";
@@ -4209,7 +4212,7 @@ function createUI() {
     createPanel();
     createDrawer();
     bindAll();
-    setTimeout(function(){ ipeRefreshApiProfileEditors(); ipeRefreshSystemPromptEditors(); ipeRefreshTemplateEditors(); ipeRefreshAnchorEditors(); ipeRefreshRuleEditors(); ipeSetStopButtonsState(!!ipeAbortController); try { ipeImgBindLayerUI(); ipeImgRefreshLayerUI(); } catch(eL) {} try { ipeInstallZoomButtons(); } catch(eZ) {} }, 120);
+    setTimeout(function(){ ipeRefreshApiProfileEditors(); ipeRefreshSystemPromptEditors(); ipeRefreshTemplateEditors(); ipeRefreshAnchorEditors(); ipeRefreshRuleEditors(); ipeSetStopButtonsState(!!ipeAbortController); try { ipeImgBindLayerUI(); ipeImgRefreshLayerUI(); } catch(eL) {} try { ipeInstallZoomButtons(); } catch(eZ) {} try { ipeRefreshSuppPresets(); } catch(eS) {} try { ipeInstallMesButtonsObserver(); ipeInstallMesButtons(); } catch(eM) {} }, 120);
     setTimeout(function(){ try { ipeInstallZoomButtons(); } catch(eZ) {} }, 2500);   // 抽屉晚到也补上
     setTimeout(function(){ ipeSetActiveTab(cfg().activeTab || "image"); ipeLedgerSync(); ipeLedgerInstallInlineObserver(); }, 160);
 }
@@ -4713,11 +4716,17 @@ function createPanel() {
         '</div>'+
         '<textarea id="ipe-preview-text" rows="6" placeholder="生成的 Description 将显示在这里…"></textarea>'+
         '<label>补充指令<input type="text" id="ipe-supplement" placeholder="例：这段是冷战不是撒娇"></label>'+
+        '<div class="ipe-preview-actions" style="margin-top:2px;align-items:center"><select id="ipe-supp-presets" style="flex:1;min-width:0"><option value="">常用短语…</option></select>'+
+        '<button id="ipe-supp-save" class="ipe-btn" style="flex:none" title="把补充指令框里这句存起来">存为常用</button>'+
+        '<button id="ipe-supp-del" class="ipe-btn" style="flex:none" title="删掉下拉里选中的那条">删</button></div>'+
         '<div class="ipe-preview-actions">'+
         '<button id="ipe-btn-save-now" class="ipe-btn">保存设置</button><button id="ipe-btn-extract" class="ipe-btn">手动提取</button>'+
         '<button id="ipe-btn-stop" class="ipe-btn" disabled>打断请求</button>'+
         '<button id="ipe-btn-reroll" class="ipe-btn" disabled>重新生成</button>'+
-        '<button id="ipe-btn-inject" class="ipe-btn ipe-btn-primary" disabled>确认注入</button></div>');
+        '<button id="ipe-btn-inject" class="ipe-btn ipe-btn-primary" disabled>确认注入</button></div>'+
+        '<div class="ipe-preview-actions" style="margin-top:6px;align-items:center"><select id="ipe-reinject-tpl" style="flex:1;min-width:0"></select>'+
+        '<button id="ipe-btn-reinject" class="ipe-btn" style="flex:none">换画风重注入</button></div>'+
+        '<div class="ipe-hint">不重新提取：换个基础模板，把这楼楼尾那块 &lt;draw&gt; 按新模板重拼一遍替换掉，旧的不留。这里选的就是「基础模板」里的模板预设，两边同步。</div>');
 
     h += secHTML("ledger","\uD83D\uDCCB 账本（本聊天）", false,
         '<div id="ipe-ledger-chatkey" class="ipe-hint" style="margin-bottom:6px"></div>'+
@@ -4930,6 +4939,8 @@ function createDrawer() {
        + '<small style="color:#888">锁住的层不重提；「只重摇这层」= 其余各层临时锁定。环境 / 氛围没变时沿用上一楼。模板可用 {Camera} {Env} {Mood} {Chars} {Pose}，{Description} 拿剩下的层。</small></div>';
     h += '<textarea id="iped-preview-text" class="text_pole" rows="5" placeholder="生成的 Description 将显示在这里…"></textarea>';
     h += '<label>补充指令</label><input type="text" id="iped-supplement" class="text_pole" placeholder="例：这段是冷战不是撒娇">';
+    h += '<div style="display:flex;gap:6px;margin-top:4px;align-items:center"><select id="iped-supp-presets" class="text_pole" style="flex:1;min-width:0"><option value="">常用短语…</option></select>';
+    h += '<input type="button" id="iped-supp-save" class="menu_button" value="存为常用"><input type="button" id="iped-supp-del" class="menu_button" value="删"></div>';
     h += '<div style="display:flex;gap:6px;margin-top:6px">';
     h += '<input type="button" id="iped-btn-save-now" class="menu_button" value="保存设置">';
     h += '<input type="button" id="iped-btn-extract" class="menu_button" value="手动提取">';
@@ -4937,6 +4948,9 @@ function createDrawer() {
     h += '<input type="button" id="iped-btn-reroll" class="menu_button" value="重新生成" disabled>';
     h += '<input type="button" id="iped-btn-inject" class="menu_button" value="确认注入" disabled>';
     h += '</div>';
+    h += '<div style="display:flex;gap:6px;margin-top:6px;align-items:center"><select id="iped-reinject-tpl" class="text_pole" style="flex:1;min-width:0"></select>';
+    h += '<input type="button" id="iped-btn-reinject" class="menu_button" value="换画风重注入"></div>';
+    h += '<small style="color:#888">不重新提取：换个基础模板，把这楼楼尾那块 &lt;draw&gt; 按新模板重拼替换。</small>';
     h += '</div>';
     h += '<div data-ipe-tab="ledger">';
     h += '<div id="iped-ledger-chatkey" style="color:#888;font-size:11px;margin:4px 0"></div>';
@@ -5544,7 +5558,7 @@ function bindAll() {
         });
     });
 
-    ["ipe-template-slot","iped-template-slot"].forEach(function(id){
+    ["ipe-template-slot","iped-template-slot","ipe-reinject-tpl","iped-reinject-tpl"].forEach(function(id){
         var el=q("#"+id); if(!el) return;
         el.addEventListener("change", function(){
             saveCritical("activeBaseTemplate", el.value);
@@ -5754,6 +5768,15 @@ function bindAll() {
         var be=q("#"+p+"-btn-extract"); if(be && !be.__ipeBound){ be.__ipeBound = true; be.addEventListener("click", onExtract); }
         var br=q("#"+p+"-btn-reroll"); if(br && !br.__ipeBound){ br.__ipeBound = true; br.addEventListener("click", onReroll); }
         var bj=q("#"+p+"-btn-inject"); if(bj && !bj.__ipeBound){ bj.__ipeBound = true; bj.addEventListener("click", onInject); }
+        var bri=q("#"+p+"-btn-reinject"); if(bri && !bri.__ipeBound){ bri.__ipeBound = true; bri.addEventListener("click", onReinject); }
+        var ssv=q("#"+p+"-supp-save"); if(ssv && !ssv.__ipeBound){ ssv.__ipeBound = true; ssv.addEventListener("click", ipeSuppSaveCurrent); }
+        var sdl=q("#"+p+"-supp-del"); if(sdl && !sdl.__ipeBound){ sdl.__ipeBound = true; sdl.addEventListener("click", ipeSuppDeleteSelected); }
+        var ssl=q("#"+p+"-supp-presets"); if(ssl && !ssl.__ipeBound){ ssl.__ipeBound = true; ssl.addEventListener("change", function(){
+            var list = ipeGetSuppPresets(); var i = Number(ssl.value);
+            if (ssl.value === "" || !Number.isFinite(i) || !list[i]) return;
+            ipeSuppFill(list[i]);
+            var other = q("#" + (p === "ipe" ? "iped" : "ipe") + "-supp-presets"); if (other) other.value = ssl.value;
+        }); }
         var bm=q("#"+p+"-btn-models"); if(bm && !bm.__ipeBound){ bm.__ipeBound = true; bm.addEventListener("click", fetchModels); }
         var bt=q("#"+p+"-btn-test"); if(bt && !bt.__ipeBound){ bt.__ipeBound = true; bt.addEventListener("click", testConnection); }
         var bs=q("#"+p+"-btn-stop"); if(bs && !bs.__ipeBound){ bs.__ipeBound = true; bs.addEventListener("click", ipeAbortCurrentRequest); }
@@ -6262,6 +6285,7 @@ function bindAll() {
                     ipeLedgerStatus("已切换到本聊天的账本", "#6ec577");
                     try { ipeLedgerModeRefresh(); } catch(eS) {}   // 卡槽显示换成这张卡的
                     try { ipeImgRefreshLayerUI(); } catch(eL) {}   // 四个层框换成本聊天的
+                    try { ipeInstallMesButtonsObserver(); ipeInstallMesButtons(); } catch(eM) {}   // 楼层 🎨 按钮换成本聊天的
                 }, 200);
             });
             console.log("[IPE] 已绑定换聊天事件");
@@ -6367,10 +6391,30 @@ function buildInjectTag(desc, layers) {
     return tpl.slice(0, phs[0].i) + desc + tpl.slice(phs[phs.length - 1].e);
 }
 
-function injectDescToMessage(desc, targetIdx) {
-    var idx = typeof targetIdx === "number" ? targetIdx : currentIdx;
-    if (idx < 0) throw new Error("消息不存在");
+/* 在这楼的 extra 里记下本次注入的那块原文：换画风重注入时先按它原样剥，模板后来改了、删了都认得。 */
+function ipeRememberInjectTag(msg, tag, desc, layers) {
+    try {
+        if (!msg.extra || typeof msg.extra !== "object") msg.extra = {};
+        msg.extra.ipe_inject_tag = String(tag || "");
+        // 2.16.0 连描述和五层一起记：翻到哪楼都能按新模板重拼，刷新页面也不丢
+        msg.extra.ipe_inject_desc = String(desc || "");
+        var ly = null;
+        if (layers && typeof layers === "object") { ly = {}; IPE_IMG_LAYERS.forEach(function(l){ ly[l] = String(layers[l] || ""); }); }
+        msg.extra.ipe_inject_layers = ly;
+    } catch(e) {}
+}
+/* 这楼记过的提取结果；没有就 null */
+function ipeInjectRecord(msg) {
+    try {
+        var ex = msg && msg.extra;
+        if (!ex || !String(ex.ipe_inject_desc || "").trim()) return null;
+        var ly = (ex.ipe_inject_layers && typeof ex.ipe_inject_layers === "object" && ipeImgJoinLayers(ex.ipe_inject_layers)) ? ex.ipe_inject_layers : null;
+        return { desc: String(ex.ipe_inject_desc), layers: ly };
+    } catch(e) { return null; }
+}
 
+/* 注入用的内容：预览框 → currentDesc；分层开着且本次分层新鲜时带上层框 */
+function ipeResolveInjectPayload(desc) {
     var pv=q("#ipe-preview-text"), pvd=q("#iped-preview-text");
     if (!desc) desc = (pv&&pv.value)||(pvd&&pvd.value)||currentDesc;
     var layers = null;
@@ -6379,6 +6423,15 @@ function injectDescToMessage(desc, targetIdx) {
         if (ipeImgJoinLayers(bx)) layers = bx;
         if (!desc) desc = ipeImgJoinLayers(bx);
     }
+    return { desc: String(desc || ""), layers: layers };
+}
+
+function injectDescToMessage(desc, targetIdx) {
+    var idx = typeof targetIdx === "number" ? targetIdx : currentIdx;
+    if (idx < 0) throw new Error("消息不存在");
+
+    var p = ipeResolveInjectPayload(desc);
+    desc = p.desc; var layers = p.layers;
     if (!desc) throw new Error("没有内容");
 
     var c = ctx();
@@ -6391,6 +6444,7 @@ function injectDescToMessage(desc, targetIdx) {
     }
 
     msg.mes = String(msg.mes || "").trimEnd() + "\n\n" + tag;
+    ipeRememberInjectTag(msg, tag, desc, layers);
     // 酒馆左右滑 swipe 时会用 swipes[swipe_id] 覆盖 mes（syncSwipeToMes），
     // 只写 mes 不写 swipes，一滑回来注入的 tag 就没了。两边同步。
     try {
@@ -6402,8 +6456,226 @@ function injectDescToMessage(desc, targetIdx) {
 
     var el=q('#chat .mes[mesid="'+idx+'"] .mes_text');
     if(el && el.innerHTML.indexOf(esc(tag)) < 0) el.insertAdjacentHTML("beforeend", "<p>"+esc(tag)+"</p>");
+    try { ipeInstallMesButtons(); } catch(eB) {}   // 这楼刚有了记录，🎨 立刻挂上，不等观察器
 
     return { injected: true, tag: tag };
+}
+
+/* ============================================================
+   🎨 换画风重注入（2.15.0）
+   提取结果不动、不叫副 AI：把目标楼楼尾那块生图 tag（按用户所有模板 + 内置 + 老版 image### 剥）
+   剥掉，再按当前选中的基础模板重拼一块追加回去。没提取过这楼也行——
+   层框是这楼存下来的就用层框；预览框空、层框也对不上，就直说先提取一次。
+   ============================================================ */
+function reinjectDescToMessage(targetIdx, opts) {
+    opts = opts || {};
+    var c = ctx();
+    var chat = c.chat || [];
+    var idx = typeof targetIdx === "number" ? targetIdx : currentIdx;
+    if (idx < 0) {
+        for (var k = chat.length - 1; k >= 0; k--) {
+            var m0 = chat[k];
+            if (m0 && !m0.is_user && m0.is_system !== true && String(m0.mes || "").trim()) { idx = k; break; }
+        }
+    }
+    if (idx < 0 || !chat[idx]) throw new Error("找不到要注入的楼");
+    var msg = chat[idx];
+
+    /* 内容从哪来：
+       · 楼层按钮（preferRecord）或不是刚提取那楼：先用这楼记录的描述 + 五层（预览框里是别楼的，不能拿）
+       · 面板按钮、且就是刚提取那楼（或还没定位过楼）：先用预览框 / 层框，人刚改过的算数 */
+    var rec = ipeInjectRecord(msg);
+    var previewFirst = !opts.preferRecord && (idx === currentIdx || currentIdx < 0);   // 还没定位过楼时预览框不属于任何楼，面板按钮照旧拿它
+    var p = { desc: "", layers: null };
+    var fromPreview = function(){
+        p = ipeResolveInjectPayload("");
+        if (!p.layers && ipeImgLayeredOn()) {
+            // 分层不「新鲜」（比如刷新过页面）但存档就是这一楼的：层框可信，照用
+            var st = ipeImgLayersRead(), bx = ipeImgLayerBoxValues();
+            if (st && Number(st.floor) === idx + 1 && ipeImgJoinLayers(bx)) {
+                p.layers = bx;
+                if (!p.desc) p.desc = ipeImgJoinLayers(bx);
+            }
+        }
+    };
+    if (previewFirst) fromPreview();
+    if (!p.desc && rec) p = { desc: rec.desc, layers: rec.layers };
+    if (!p.desc) throw new Error(previewFirst ? "预览框是空的，先提取一次" : "这楼没有提取记录，先提取一次");
+
+    var before = String(msg.mes || "");
+    // 先按这楼记录的「上次注入的那块」原样剥（模板后来改了、删了都认），再按模板规则兜底剥一遍
+    var stripped = before, prevTag = "";
+    try {
+        prevTag = String((msg.extra && msg.extra.ipe_inject_tag) || "");
+        if (prevTag) { var kp = stripped.lastIndexOf(prevTag); if (kp >= 0) stripped = stripped.slice(0, kp) + stripped.slice(kp + prevTag.length); }
+    } catch(ePT) {}
+    stripped = ipeLedgerStripImageTag(stripped);
+    var tag = buildInjectTag(p.desc, p.layers);
+    var next = stripped.replace(/\s+$/, "") + "\n\n" + tag;
+    if (next === before) return { injected: false, reason: "same", tag: tag, idx: idx, replaced: false };
+
+    msg.mes = next;
+    ipeRememberInjectTag(msg, tag, p.desc, p.layers);
+    try {
+        if (Array.isArray(msg.swipes) && Number.isInteger(msg.swipe_id) && msg.swipe_id >= 0 && msg.swipe_id < msg.swipes.length) {
+            msg.swipes[msg.swipe_id] = msg.mes;
+        }
+    } catch(eSw) {}
+    if (typeof c.saveChat === "function") c.saveChat();
+    ipeSwapInjectedParagraph(idx, tag, prevTag);
+    try { ipeInstallMesButtons(); } catch(eB) {}
+    return { injected: true, tag: tag, idx: idx, replaced: stripped !== before };
+}
+
+/* 楼里的 DOM 只换我们自己那一段，绝不整楼重排（2.15.1）。
+   2.15.0 走了酒馆 updateMessageBlock 整楼重画：楼里把 html 代码块渲染成前端卡的扩展只在自己的事件里干活，
+   重画之后它们不再跑一遍，整楼就成了一屏源码。照老注入的做法：
+   把上次注入追加的那个 <p>（文字等于记录的原文，或剥掉 tag 后什么都不剩）摘掉，再追加新的 <p>，其余节点一概不碰。 */
+function ipeSwapInjectedParagraph(idx, tag, prevTag) {
+    var el = q('#chat .mes[mesid="' + idx + '"] .mes_text'); if (!el) return;
+    var prev = String(prevTag || "").trim();
+    try {
+        Array.prototype.slice.call(el.children).forEach(function(ch){
+            var t = String(ch.textContent || "").trim();
+            if (!t) return;
+            if ((prev && t === prev) || !ipeLedgerStripImageTag(t).trim()) ch.remove();
+        });
+    } catch(e) {}
+    if (el.innerHTML.indexOf(esc(tag)) < 0) el.insertAdjacentHTML("beforeend", "<p>" + esc(tag) + "</p>");
+}
+
+/* ============================================================
+   🎨 楼层按钮（2.16.0）：每条记过提取结果的 AI 楼，操作栏里多一个 🎨，
+   点了就按当前选中的模板重拼那一楼。只挂在有记录的楼上，没记录的楼不出按钮。
+   ============================================================ */
+var IPE_MES_BTN_CLASS = "ipe-mes-reinject";
+function ipeInstallMesButtons() {
+    var d = ipeRootDocument();
+    var chatEl = d.querySelector("#chat"); if (!chatEl) return 0;
+    var chat = (ctx() && ctx().chat) || [];
+    var n = 0;
+    Array.prototype.slice.call(chatEl.querySelectorAll(".mes")).forEach(function(m){
+        var idx = Number(m.getAttribute("mesid"));
+        if (!Number.isFinite(idx)) return;
+        var msg = chat[idx];
+        var has = m.querySelector("." + IPE_MES_BTN_CLASS);
+        var want = !!(msg && !msg.is_user && ipeInjectRecord(msg));
+        if (want && !has) {
+            /* 2.16.1 放在「…」旁边常驻可见：手机上 .extraMesButtons 默认折叠，塞进去就得先点「…」才看得到 */
+            var html = '<div title="🐚 换画风：按当前模板重新注入这楼" class="mes_button ' + IPE_MES_BTN_CLASS + ' fa-solid fa-palette interactable" tabindex="0"></div>';
+            var hint = m.querySelector(".mes_buttons .extraMesButtonsHint");
+            var bar = m.querySelector(".mes_buttons") || m.querySelector(".extraMesButtons");
+            if (hint) hint.insertAdjacentHTML("beforebegin", html);
+            else if (bar) bar.insertAdjacentHTML("afterbegin", html);
+            else return;
+            n++;
+        } else if (!want && has) {
+            try { has.remove(); } catch(e) {}
+        }
+    });
+    return n;
+}
+function ipeInstallMesButtonsObserver() {
+    try {
+        if (window.__ipeMesBtnObs) return;
+        var d = ipeRootDocument();
+        var chatEl = d.querySelector("#chat");
+        if (!chatEl || typeof MutationObserver === "undefined") return;
+        var t = null;
+        window.__ipeMesBtnObs = new MutationObserver(function(){
+            if (t) clearTimeout(t);
+            t = setTimeout(function(){ try { ipeInstallMesButtons(); } catch(e) {} }, 250);
+        });
+        window.__ipeMesBtnObs.observe(chatEl, { childList: true, subtree: true });
+        if (!d.__ipeMesBtnClick) {
+            d.__ipeMesBtnClick = true;
+            d.addEventListener("click", function(ev){
+                var b = ev.target && ev.target.closest ? ev.target.closest("." + IPE_MES_BTN_CLASS) : null;
+                if (!b) return;
+                ev.preventDefault(); ev.stopPropagation();
+                var m = b.closest(".mes"); var idx = m ? Number(m.getAttribute("mesid")) : NaN;
+                if (Number.isFinite(idx)) onReinjectFloor(idx);
+            }, true);
+        }
+    } catch(e) {}
+}
+function onReinjectFloor(idx) {
+    var nm = String((ipeGetActiveTemplateItem() || {}).name || "");
+    try {
+        var r = reinjectDescToMessage(idx, { preferRecord: true });
+        if (r.injected) {
+            ipeNotice({ kind: "ok", title: "🐚 已换画风", body: "第 " + (r.idx + 1) + " 楼 → 「" + nm + "」" + (r.replaced ? "，旧的那块已替换" : ""), timeout: 3500 });
+            setStatus("已按「" + nm + "」重新注入第 " + (r.idx + 1) + " 楼 ✓", "#6ec577");
+        } else {
+            ipeNotice({ kind: "info", title: "🐚 没变", body: "第 " + (r.idx + 1) + " 楼已经是「" + nm + "」的注入", timeout: 3000 });
+        }
+    } catch(e) {
+        ipeNotice({ kind: "error", title: "🐚 换画风失败", body: String(e && e.message || e), timeout: 6000 });
+    }
+}
+
+/* ============================================================
+   📝 补充指令常用短语（2.16.0）：「这段是冷战不是撒娇」这种句子反复用，存起来点一下就填。
+   ============================================================ */
+function ipeGetSuppPresets() {
+    var list = ipeSafeJsonParse(cfg().supplementPresetsJson, null);
+    return Array.isArray(list) ? list.map(function(x){ return String(x || ""); }).filter(Boolean) : [];
+}
+function ipeSaveSuppPresets(list) { saveCritical("supplementPresetsJson", JSON.stringify(list || [])); ipeRefreshSuppPresets(); }
+function ipeRefreshSuppPresets() {
+    var list = ipeGetSuppPresets();
+    ["ipe-supp-presets", "iped-supp-presets"].forEach(function(id){
+        var el = q("#" + id); if (!el) return;
+        var cur = el.value;
+        var html = '<option value="">常用短语…</option>';
+        list.forEach(function(s, i){ var label = s.length > 40 ? s.slice(0, 40) + "…" : s; html += '<option value="' + i + '">' + esc(label) + '</option>'; });
+        el.innerHTML = html;
+        el.value = (cur !== "" && Number(cur) < list.length) ? cur : "";
+    });
+}
+function ipeSuppInputs() { return [q("#ipe-supplement"), q("#iped-supplement")].filter(Boolean); }
+function ipeSuppFill(text) {
+    var ins = ipeSuppInputs();
+    var curv = ""; ins.forEach(function(el){ if (!curv && el.value) curv = el.value; });
+    var cur = String(curv || "").trim();
+    var next = !cur ? text : (cur.indexOf(text) >= 0 ? cur : cur + "；" + text);
+    ins.forEach(function(el){ el.value = next; });
+}
+function ipeSuppSaveCurrent() {
+    var v = ""; ipeSuppInputs().forEach(function(el){ if (!v && el.value) v = el.value; });
+    v = String(v || "").trim();
+    if (!v) { setStatus("补充指令框是空的，先写一句再存", "#d4726a"); return false; }
+    var list = ipeGetSuppPresets();
+    if (list.indexOf(v) < 0) list.push(v);
+    ipeSaveSuppPresets(list);
+    ["ipe-supp-presets", "iped-supp-presets"].forEach(function(id){ var el = q("#" + id); if (el) el.value = String(list.indexOf(v)); });
+    setStatus("已存为常用短语（共 " + list.length + " 条）", "#6ec577");
+    return true;
+}
+function ipeSuppDeleteSelected() {
+    var sel = q("#ipe-supp-presets") || q("#iped-supp-presets");
+    var idx = sel ? Number(sel.value) : NaN;
+    var list = ipeGetSuppPresets();
+    if (!sel || sel.value === "" || !Number.isFinite(idx) || idx < 0 || idx >= list.length) { setStatus("先在常用短语里选一条再删", "#d4726a"); return false; }
+    list.splice(idx, 1);
+    ipeSaveSuppPresets(list);
+    ["ipe-supp-presets", "iped-supp-presets"].forEach(function(id){ var el = q("#" + id); if (el) el.value = ""; });
+    setStatus("已删除这条常用短语", "#6ec577");
+    return true;
+}
+
+function onReinject() {
+    try {
+        var r = reinjectDescToMessage(currentIdx);
+        var nm = String((ipeGetActiveTemplateItem() || {}).name || "");
+        if (r.injected) {
+            setStatus("已按「" + nm + "」重新注入第 " + (r.idx + 1) + " 楼 ✓" + (r.replaced ? "（旧的那块已替换）" : ""), "#6ec577");
+            var ball=q("#ipe-chat-quick-entry"); if(ball) ball.classList.remove("has-result");
+            console.log("[IPE] 换画风重注入 #" + r.idx);
+        } else {
+            setStatus("这楼已经是「" + nm + "」的注入，没变", "#6ec577");
+        }
+    } catch(e){ console.error("[IPE]", e); setStatus("重注入失败: " + e.message, "#d4726a"); }
 }
 
 function onMsgReceived(idx) {
